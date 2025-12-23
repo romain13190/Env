@@ -171,6 +171,8 @@ async def _create_task_by_type(
         return await create_synthetic_dpo_task(config, models, dpo_datasets)
     elif task_type == TaskType.GRPOTASK:
         return await create_synthetic_grpo_task(config, models, instruct_datasets)
+    elif task_type == TaskType.ENVIRONMENTTASK:
+        return await create_synthetic_env_task(config, models, instruct_datasets)
     else:
         # Default to instruct text task
         return await create_synthetic_instruct_text_task(config, models, instruct_datasets)

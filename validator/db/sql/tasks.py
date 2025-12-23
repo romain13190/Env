@@ -19,6 +19,8 @@ from validator.core.models import DpoRawTask
 from validator.core.models import DpoTask
 from validator.core.models import GrpoRawTask
 from validator.core.models import GrpoTask
+from validator.core.models import EnvTask
+from validator.core.models import EnvRawTask
 from validator.core.models import ImageRawTask
 from validator.core.models import ImageTask
 from validator.core.models import InstructTextRawTask
@@ -97,6 +99,8 @@ async def _insert_task_specific_data(connection: Connection, task: AnyTypeRawTas
         await _insert_dpo_task(connection, task, task_record)
     elif isinstance(task, GrpoRawTask):
         await _insert_grpo_task(connection, task, task_record)
+    elif isinstance(task, EnvRawTask):
+        await _insert_env_task(connection, task, task_record)
     elif isinstance(task, ChatRawTask):
         await _insert_chat_task(connection, task, task_record)
 
@@ -222,6 +226,72 @@ async def _insert_grpo_task(connection: Connection, task: GrpoRawTask, task_reco
         await connection.execute(query_grpo_task_functions, task_record[cst.TASK_ID], reward_id, reward_function.reward_weight)
 
 
+# NOTE: double check ALL of this
+async def _insert_env_task(connection: Connection, task: EnvRawTask, task_record: dict) -> None:
+    query_env = f"""
+        INSERT INTO {cst.ENV_TASKS_TABLE}
+        ({cst.TASK_ID}, {cst.FIELD_PROMPT}, {cst.FILE_FORMAT}, {cst.FIELD_EXTRA_COLUMN})
+        VALUES ($1, $2, $3, $4)
+    """
+    await connection.execute(
+        query_env,
+        task_record[cst.TASK_ID],
+        task.field_prompt,
+        task.file_format,
+        task.extra_column,
+    )
+
+    query_rollout_function = f"""
+        WITH ins AS (
+            INSERT INTO {cst.ENV_TASK_ROLLOUT_TABLE}
+            ({cst.ROLLOUT_FUNC}, {cst.FUNC_HASH}, {cst.IS_GENERIC})
+            VALUES ($1, $2, $3)
+            ON CONFLICT ({cst.FUNC_HASH}) DO NOTHING
+            RETURNING {cst.ROLLOUT_ID}
+        )
+        SELECT {cst.ROLLOUT_ID} FROM ins
+        UNION ALL
+        SELECT {cst.ROLLOUT_ID} FROM {cst.ENV_TASK_ROLLOUT_TABLE} WHERE {cst.FUNC_HASH} = $2
+        LIMIT 1
+    """
+    rollout_id = await connection.fetchval(
+        query_rollout_function, task.rollout_function.rollout_func, task.rollout_function.func_hash, task.rollout_function.is_generic
+    )
+
+    query_env_task_functions = f"""
+        INSERT INTO {cst.ENV_TASK_FUNCTIONS_TABLE}
+        ({cst.TASK_ID}, {cst.ROLLOUT_ID})
+        VALUES ($1, $2, $3)
+    """
+    await connection.execute(query_env_task_functions, task_record[cst.TASK_ID], rollout_id)
+
+
+    for reward_function in task.reward_functions:
+        query_reward_functions = f"""
+            WITH ins AS (
+                INSERT INTO {cst.REWARD_FUNCTIONS_TABLE}
+                ({cst.REWARD_FUNC}, {cst.FUNC_HASH}, {cst.IS_GENERIC})
+                VALUES ($1, $2, $3)
+                ON CONFLICT ({cst.FUNC_HASH}) DO NOTHING
+                RETURNING {cst.REWARD_ID}
+            )
+            SELECT {cst.REWARD_ID} FROM ins
+            UNION ALL
+            SELECT {cst.REWARD_ID} FROM {cst.REWARD_FUNCTIONS_TABLE} WHERE {cst.FUNC_HASH} = $2
+            LIMIT 1
+        """
+        reward_id = await connection.fetchval(
+            query_reward_functions, reward_function.reward_func, reward_function.func_hash, reward_function.is_generic
+        )
+
+        query_env_task_functions = f"""
+            INSERT INTO {cst.ENV_TASK_FUNCTIONS_TABLE}
+            ({cst.TASK_ID}, {cst.REWARD_ID}, {cst.REWARD_WEIGHT})
+            VALUES ($1, $2, $3)
+        """
+        await connection.execute(query_env_task_functions, task_record[cst.TASK_ID], reward_id, reward_function.reward_weight)
+
+
 async def get_nodes_assigned_to_task(task_id: str, psql_db: PSQLDB) -> list[Node]:
     """Get all nodes assigned to a task for the current NETUID"""
     async with await psql_db.connection() as connection:
@@ -333,6 +403,13 @@ async def get_tasks_with_status(
                     SELECT t.*, gt.field_prompt, gt.file_format, gt.extra_column
                     FROM {cst.TASKS_TABLE} t
                     LEFT JOIN {cst.GRPO_TASKS_TABLE} gt ON t.{cst.TASK_ID} = gt.{cst.TASK_ID}
+                    WHERE t.{cst.TASK_ID} = $1
+                """
+            elif task_type == TaskType.ENVIRONMENTTASK.value:
+                specific_query = f"""
+                    SELECT t.*, et.field_prompt, et.file_format, et.extra_column
+                    FROM {cst.TASKS_TABLE} t
+                    LEFT JOIN {cst.ENV_TASKS_TABLE} et ON t.{cst.TASK_ID} = et.{cst.TASK_ID}
                     WHERE t.{cst.TASK_ID} = $1
                 """
             elif task_type == TaskType.CHATTASK.value:
@@ -890,6 +967,18 @@ async def get_task_by_id(task_id: UUID, psql_db: PSQLDB) -> AnyTypeTask:
                 LEFT JOIN victorious_repo ON tasks.task_id = victorious_repo.task_id
                 WHERE tasks.{cst.TASK_ID} = $1
             """
+        elif task_type == TaskType.ENVIRONMENTTASK.value:
+            specific_query = f"""
+                {victorious_repo_cte}
+                SELECT
+                    tasks.*,
+                    et.field_prompt, et.file_format, et.extra_column,
+                    COALESCE(tasks.training_repo_backup, victorious_repo.repo) as trained_model_repository
+                FROM {cst.TASKS_TABLE} tasks
+                LEFT JOIN {cst.ENV_TASKS_TABLE} et ON tasks.{cst.TASK_ID} = et.{cst.TASK_ID}
+                LEFT JOIN victorious_repo ON tasks.task_id = victorious_repo.task_id
+                WHERE tasks.{cst.TASK_ID} = $1
+            """
         else:
             raise ValueError(f"Unsupported task type: {task_type}")
 
@@ -908,6 +997,9 @@ async def get_task_by_id(task_id: UUID, psql_db: PSQLDB) -> AnyTypeTask:
         elif task_type == TaskType.GRPOTASK.value:
             reward_functions = await get_reward_functions(task_id, psql_db)
             return GrpoTask(**full_task_data, reward_functions=reward_functions)
+        elif task_type == TaskType.ENVIRONMENTTASK.value: # NOTE FIX
+            reward_functions = await get_reward_functions(task_id, psql_db)
+            return EnvTask(**full_task_data, reward_functions=reward_functions)
         elif task_type == TaskType.CHATTASK.value:
             return ChatTask(**full_task_data)
 
@@ -1045,6 +1137,13 @@ def _get_specific_query_for_task_type(task_type: str) -> str | None:
             LEFT JOIN {cst.GRPO_TASKS_TABLE} gt ON t.{cst.TASK_ID} = gt.{cst.TASK_ID}
             WHERE t.{cst.TASK_ID} = ANY($1)
         """
+    elif task_type == TaskType.ENVIRONMENTTASK.value:
+        return f"""
+            SELECT t.*, et.field_prompt, et.file_format
+            FROM {cst.TASKS_TABLE} t
+            LEFT JOIN {cst.ENV_TASKS_TABLE} et ON t.{cst.TASK_ID} = et.{cst.TASK_ID}
+            WHERE t.{cst.TASK_ID} = ANY($1)
+        """
     return None
 
 
@@ -1066,6 +1165,9 @@ async def _create_task_from_data(
     elif task_type == TaskType.GRPOTASK.value:
         reward_functions = await get_reward_functions(task_id, psql_db, conn)
         return GrpoRawTask(**full_task_data, reward_functions=reward_functions)
+    elif task_type == TaskType.ENVIRONMENTTASK.value: # NOTE FIX
+        reward_functions = await get_reward_functions(task_id, psql_db, conn)
+        return EnvRawTask(**full_task_data, reward_functions=reward_functions)
 
     return None
 
@@ -1171,6 +1273,17 @@ async def get_tasks_by_account_id(psql_db: PSQLDB, account_id: UUID, limit: int 
                     task_data.update(dict(grpo_row))
                 reward_functions = await get_reward_functions(task_data[cst.TASK_ID], psql_db)
                 tasks.append(GrpoTask(**task_data, reward_functions=reward_functions))
+            elif task_type == TaskType.ENVIRONMENTTASK.value:
+                env_query = f"""
+                    SELECT field_prompt, file_format
+                    FROM {cst.ENV_TASKS_TABLE}
+                    WHERE {cst.TASK_ID} = $1
+                """
+                env_row = await connection.fetchrow(env_query, task_data[cst.TASK_ID])
+                if env_row:
+                    task_data.update(dict(env_row))
+                reward_functions = await get_reward_functions(task_data[cst.TASK_ID], psql_db)
+                tasks.append(EnvTask(**task_data, reward_functions=reward_functions))
         return tasks
 
 

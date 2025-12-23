@@ -15,6 +15,7 @@ from core.models.utility_models import DpoDatasetType
 from core.models.utility_models import FileFormat
 from core.models.utility_models import GrpoDatasetType
 from core.models.utility_models import InstructTextDatasetType
+from core.models.utility_models import EnvironmentDatasetType
 from core.models.utility_models import TaskStatus
 from core.models.utility_models import TaskType
 from core.models.utility_models import TextDatasetType
@@ -40,6 +41,7 @@ from validator.utils.minio import async_minio_client
 logger = get_logger(__name__)
 
 
+# NOTE Higher better for env task
 def calculate_miner_ranking_and_scores(
     miner_results: list[MinerResultsText | MinerResultsImage],
 ) -> list[MinerResultsText | MinerResultsImage]:
@@ -185,6 +187,13 @@ def _get_dataset_type(task: AnyTypeRawTask) -> TextDatasetType | None:
             reward_functions=task.reward_functions,
             extra_column=task.extra_column,
         )
+    elif task.task_type == TaskType.ENVIRONMENTTASK:
+        return EnvironmentDatasetType(
+            field_prompt=task.field_prompt,
+            rollout_function=task.rollout_function,
+            reward_functions=task.reward_functions,
+            extra_column=task.extra_column,
+        )
     elif task.task_type == TaskType.CHATTASK:
         return ChatTemplateDatasetType(
             chat_template=task.chat_template,
@@ -201,7 +210,7 @@ def _get_dataset_type(task: AnyTypeRawTask) -> TextDatasetType | None:
 def _create_failed_miner_result(hotkey: str, score_reason: str, task_type: TaskType) -> MinerResults:
     """Create a result object for failed miner submissions with initial score of 0.0.
     The score may later be adjusted to a penalty if valid submissions exist."""
-    if task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK]:
+    if task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK, TaskType.ENVIRONMENTTASK]:
         return MinerResultsText(
             hotkey=hotkey,
             test_loss=np.nan,
@@ -249,7 +258,7 @@ async def _evaluate_submissions(
     if len(unique_repos) != len(submission_repos):
         logger.warning(f"Found duplicate repos. Deduplicating {len(submission_repos)} repos to {len(unique_repos)} unique repos")
 
-    if task.task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK]:
+    if task.task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK, TaskType.ENVIRONMENTTASK]:
         results: dict[str, EvaluationResultText | Exception] = {}
         repos_to_evaluate = []
         for repo in unique_repos:
@@ -532,7 +541,7 @@ async def process_miners_pool(
                             )
                         )
                         continue
-                    elif task.task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK]:
+                    elif task.task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK, TaskType.ENVIRONMENTTASK]:
                         test_result = eval_result
                     elif task.task_type == TaskType.IMAGETASK:
                         test_result = eval_result
@@ -548,7 +557,7 @@ async def process_miners_pool(
                         updated_on=datetime.now(),
                     )
 
-                if task.task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK]:
+                if task.task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK, TaskType.ENVIRONMENTTASK]:
                     results.append(
                         MinerResultsText(
                             hotkey=miner.hotkey,
@@ -637,6 +646,7 @@ async def evaluate_and_score(task: AnyTypeRawTask, gpu_ids: list[int], config: C
             TaskType.GRPOTASK,
             TaskType.CHATTASK,
             TaskType.IMAGETASK,
+            TaskType.ENVIRONMENTTASK
         ]:
             files_to_delete = [task.training_data, task.test_data]
         else:

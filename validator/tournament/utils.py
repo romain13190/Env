@@ -73,6 +73,8 @@ def get_tournament_gpu_requirement(task_type: TaskType, model_params_count: int,
         params_b *= TOURNAMENT_DPO_GPU_MULTIPLIER
     elif task_type == TaskType.GRPOTASK:
         params_b *= TOURNAMENT_GRPO_GPU_MULTIPLIER
+    elif task_type == TaskType.ENVIRONMENTTASK:
+        params_b *= TOURNAMENT_GRPO_GPU_MULTIPLIER
 
     if params_b <= TOURNAMENT_GPU_THRESHOLD_FOR_2X_H100:
         return GpuRequirement.H100_1X
@@ -189,7 +191,7 @@ async def get_task_results_for_ranking(task_id: str, psql_db: PSQLDB) -> list[Mi
             continue
 
         # Create appropriate MinerResults object
-        if task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.CHATTASK, TaskType.DPOTASK, TaskType.GRPOTASK]:
+        if task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.CHATTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.ENVIRONMENTTASK]:
             miner_result = MinerResultsText(
                 hotkey=hotkey,
                 test_loss=test_loss,

@@ -19,8 +19,11 @@ OFFER_RESPONSES_TABLE = "offer_responses"
 LATEST_SCORES_URL_TABLE = "latest_scores_url"
 IMAGE_TEXT_PAIRS_TABLE = "image_text_pairs"
 GRPO_TASKS_TABLE = "grpo_tasks"
+ENV_TASKS_TABLE = "env_tasks"
 REWARD_FUNCTIONS_TABLE = "reward_functions"
 GRPO_TASK_FUNCTIONS_TABLE = "grpo_task_functions"
+ENV_TASK_FUNCTIONS_TABLE = "env_task_functions"
+ENV_TASK_ROLLOUT_TABLE = "env_task_rollouts"
 
 # Tournament Tables
 TOURNAMENTS_TABLE = "tournaments"
@@ -121,6 +124,13 @@ CHAT_ASSISTANT_REFERENCE = "chat_assistant_reference"
 # Reward Functions Table Columns
 REWARD_ID = "reward_id"
 REWARD_FUNC = "reward_func"
+FUNC_HASH = "func_hash"
+IS_GENERIC = "is_generic"
+IS_MANUAL = "is_manual"
+
+# Rollout Functions Table Columns
+ROLLOUT_ID = "rollout_id"
+ROLLOUT_FUNC = "rollout_func"
 FUNC_HASH = "func_hash"
 IS_GENERIC = "is_generic"
 IS_MANUAL = "is_manual"

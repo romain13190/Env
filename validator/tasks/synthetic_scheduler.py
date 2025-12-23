@@ -24,9 +24,11 @@ from validator.core.config import Config
 from validator.core.models import Dataset
 from validator.core.models import DpoRawTask
 from validator.core.models import GrpoRawTask
+from validator.core.models import EnvRawTask
 from validator.core.models import InstructTextRawTask
 from validator.core.models import RawTask
 from validator.core.models import RewardFunction
+from validator.core.models import RolloutFunction
 from validator.db.sql import grpo as grpo_sql
 from validator.db.sql.grpo import get_generic_reward_functions_from_db
 from validator.db.sql.tasks import add_task
@@ -347,6 +349,19 @@ async def _get_generic_reward_functions(config: Config) -> list[RewardFunction]:
     return reward_functions
 
 
+# TODO Finish this
+async def _get_hardcoded_alfworld_rollout_function(config: Config) -> RolloutFunction:
+    rollout_function = RolloutFunction(
+        rollout_id="1",
+        rollout_function="alfworld_rollout",
+        func_hash="",
+        is_generic=True,
+        is_manual=True,
+    )
+
+    return rollout_function
+
+
 def _randomize_reward_weights(reward_functions: list[RewardFunction]) -> list[RewardFunction]:
     # Generate random weights
     random_weights = [random.uniform(0.1, 10.0) for _ in reward_functions]
@@ -391,6 +406,47 @@ async def create_synthetic_grpo_task(
         ds=dataset.dataset_id,
         field_prompt=columns.field_instruction,
         reward_functions=reward_functions,
+        status=TaskStatus.PENDING,
+        is_organic=False,
+        created_at=current_time,
+        termination_at=end_timestamp,
+        hours_to_complete=number_of_hours,
+        account_id=vcst.NULL_ACCOUNT_ID,
+        yarn_factor=yarn_factor,
+    )
+    logger.info(f"New GRPO task created with dataset {dataset.dataset_id}, yarn_factor={yarn_factor}")
+
+    task = await add_task(task, config.psql_db)
+
+    return task
+
+
+@retry_with_backoff
+async def create_synthetic_env_task(
+    config: Config,
+    models: AsyncGenerator[str, None],
+    datasets: AsyncGenerator[Dataset, None],
+) -> RawTask:
+    model_id = await anext(models)
+
+    dataset = await get_dataset(datasets, task_type=TaskType.ENVIRONMENTTASK, keypair=config.keypair)
+
+    number_of_hours = _get_training_hours_from_num_rows(dataset.num_rows)
+    columns = await _get_columns_for_instruct_dataset(dataset.dataset_id, config.keypair)
+
+    current_time = datetime.utcnow()
+    end_timestamp = current_time + timedelta(hours=number_of_hours)
+
+    reward_functions = await _get_generic_reward_functions(config)
+    rollout_function = await _get_hardcoded_alfworld_rollout_function(config)
+
+    yarn_factor = maybe_get_yarn_factor()
+    task = EnvRawTask(
+        model_id=model_id,
+        ds=dataset.dataset_id,
+        field_prompt=columns.field_instruction,
+        reward_functions=reward_functions,
+        rollout_function=rollout_function,
         status=TaskStatus.PENDING,
         is_organic=False,
         created_at=current_time,
@@ -484,6 +540,7 @@ async def create_synthetic_affine_grpo_task(
 
     except Exception as e:
         logger.error(f"Failed to create affine GRPO task: {e}")
+        
 
 
 @retry_with_backoff

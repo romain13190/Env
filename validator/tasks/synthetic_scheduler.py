@@ -442,6 +442,7 @@ async def create_synthetic_env_task(
         model_id=model_id,
         ds=dataset.dataset_id,
         status=TaskStatus.PENDING,
+        environment_name="alfworld",
         is_organic=False,
         created_at=current_time,
         termination_at=end_timestamp,

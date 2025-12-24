@@ -602,6 +602,18 @@ async def get_knockout_winners(
                     logger.info(
                         f"GRPO task: Opponent wins (higher is better): {opponent_loss:.6f} >= {boss_loss * boss_multiplier:.6f}"
                     )
+            elif task_object.task_type == TaskType.ENVIRONMENTTASK:
+                if boss_loss * boss_multiplier > opponent_loss:
+                    task_winners.append(boss_hotkey)
+                    logger.info(
+                        f"Environment task: Boss wins (higher is better): {boss_loss:.6f} * "
+                        f"{boss_multiplier:.3f} = {boss_loss * boss_multiplier:.6f} > {opponent_loss:.6f}"
+                    )
+                else:
+                    task_winners.append(opponent_hotkey)
+                    logger.info(
+                        f"Environment task: Opponent wins (higher is better): {opponent_loss:.6f} >= {boss_loss * boss_multiplier:.6f}"
+                    )
             else:
                 # For other tasks, lower scores are better
                 if boss_loss * boss_divisor < opponent_loss:

@@ -22,8 +22,7 @@ GRPO_TASKS_TABLE = "grpo_tasks"
 ENV_TASKS_TABLE = "env_tasks"
 REWARD_FUNCTIONS_TABLE = "reward_functions"
 GRPO_TASK_FUNCTIONS_TABLE = "grpo_task_functions"
-ENV_TASK_FUNCTIONS_TABLE = "env_task_functions"
-ENV_TASK_ROLLOUT_TABLE = "env_task_rollouts"
+
 
 # Tournament Tables
 TOURNAMENTS_TABLE = "tournaments"

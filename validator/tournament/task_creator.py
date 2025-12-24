@@ -415,7 +415,7 @@ async def _create_single_new_text_task(
 ) -> RawTask | None:
     """Create a single new synthetic text task of a specific type."""
     try:
-        if task_type not in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK]:
+        if task_type not in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.ENVIRONMENTTASK]:
             logger.error(f"Unknown task type {task_type} for boss round text task")
             return None
         

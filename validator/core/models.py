@@ -167,7 +167,6 @@ class EnvRawTask(RawTask):
     """
 
     environment_name: str | None = None
-    file_format: FileFormat = FileFormat.HF
     task_type: TaskType = TaskType.ENVIRONMENTTASK
     synthetic_data: str | None = None
 

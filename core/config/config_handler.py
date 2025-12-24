@@ -159,20 +159,3 @@ def create_reward_funcs_file(reward_funcs: list[str], task_id: str, destination_
     return filename, func_names
 
 
-def create_rollout_func_file(rollout_func: str, task_id: str, destination_dir: str = cst.CONFIG_DIR) -> str:
-    """
-    Create a Python file with a rollout function for GRPO training.
-    Args:
-        rollout_func: List of strings containing the Python rollout function implementation
-        task_id: Unique task identifier
-    """
-    filename = f"rollout_{task_id}"
-    filepath = os.path.join(destination_dir, f"{filename}.py")
-
-    func_name = rollout_func.split("def ")[1].split("(")[0].strip()
-
-    with open(filepath, "w") as f:
-        f.write("# Auto-generated rollout function file\n\n")
-        f.write(f"{rollout_func}\n\n")
-
-    return filename, func_name

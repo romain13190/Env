@@ -381,21 +381,24 @@ def run_downloader_container(
                 logger.warning(f"Failed to remove container {container_name}: {cleanup_err}", extra=log_labels)
 
 
-async def run_environment_server_container(log_labels: dict) -> Container:
+async def run_environment_server_container(environment_name: str, log_labels: dict) -> Container:
     client = docker.from_env()
     container_name = f"environment-server-{uuid.uuid4().hex[:8]}"
     logger.info(f"Starting env server container: {container_name}", extra=log_labels)
 
-    # Run the alfworld server
-    container = await asyncio.to_thread(
-        client.containers.run,
-        image="affinefoundation/agentgym:alfworld",
-        name=container_name,
-        detach=True,
-        labels=log_labels,
-        network_mode="bridge",
-    )
-    return container
+    if environment_name == "alfworld":
+        # Run the alfworld server
+        container = await asyncio.to_thread(
+            client.containers.run,
+            image="affinefoundation/agentgym:alfworld",
+            name=container_name,
+            detach=True,
+            labels=log_labels,
+            network_mode="bridge",
+        )
+        return container
+    else:
+        return None
 
 
 async def upload_repo_to_hf(
@@ -588,12 +591,11 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
 
         env_urls = []
         env_server_url_str = None
-        if task_type == TaskType.ENVIRONMENTTASK: # TODO: Later also change server based on environment, currently alf only
+        if task_type == TaskType.ENVIRONMENTTASK:
             logger.info("Running Environment Server Containers", extra=log_labels)
             await log_task(training_data.task_id, task.hotkey, "Starting Environment Servers...")
-
             for gpu in task.gpu_ids:
-                environment_server_container = await run_environment_server_container(log_labels)
+                environment_server_container = await run_environment_server_container(task.training_data.dataset_type.environment_name, log_labels)
                 env_server_containers.append(environment_server_container)
                 ip_address = await wait_for_env_container_ip(environment_server_container)
                 env_urls.append(f"http://{ip_address}:8000")

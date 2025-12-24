@@ -37,7 +37,6 @@ from core.models.utility_models import EnvironmentDatasetType
 from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import TaskType
 from core.config.config_handler import create_reward_funcs_file
-from core.config.config_handler import create_rollout_func_file
 
 
 def patch_wandb_symlinks(base_dir: str):

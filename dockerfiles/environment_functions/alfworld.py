@@ -44,6 +44,7 @@ def alfworld_rollout_first_prompt_and_completion(prompts: list[str], trainer, ma
         episode_logprobs: list[float] = []
         invalid_count = 0
         done = False
+        solved = False
         turn_number = 0
 
         # Create new environment game

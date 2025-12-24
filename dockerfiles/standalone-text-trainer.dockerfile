@@ -36,7 +36,7 @@ COPY core/config/base.yml /workspace/axolotl/base.yml
 COPY core/config/base_grpo.yml /workspace/axolotl/base_grpo.yml
 COPY core/config/base_environment.yml /workspace/axolotl/base_environment.yml
 
-ENV PYTHONPATH="${PYTHONPATH}:/workspace/axolotl/environment_functions"
+ENV PYTHONPATH="/workspace/axolotl/env_funcs:/usr/local/lib/python3.11/site-packages"
 
 RUN chmod +x /workspace/scripts/run_text_trainer.sh /workspace/scripts/text_trainer.py
 

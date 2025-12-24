@@ -40,7 +40,8 @@ docker run --rm \
   --model "$MODEL" \
   --dataset "$DATASET" \
   --file-format "$FILE_FORMAT" \
-  --task-type "GrpoTask"
+  --task-type "EnvTask"
+
 
 docker run --rm --gpus all \
   --security-opt=no-new-privileges \

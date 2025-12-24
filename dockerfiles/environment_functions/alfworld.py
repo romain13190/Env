@@ -1,3 +1,13 @@
+"""
+This is an example of a working Rollout Function implementation for the Alfworld Environment Task.
+The design of a rollout function has a huge impact on the quality of the trained model on that task.
+For Environment Tasks miners are expected to implement their own rollout function.
+You can always expect the environment server url for that task to be available in the env variable 'ENVIRONMENT_SERVER_URL'.
+For most (if not all) tasks the environment server can be expected to have a standardized interface with /reset, /step, and /observe endpoints.
+While this example is for Alfworld without the use of the AlfWorldEnvClient the design should work for all standardized environment tasks.
+This is a unoptimized implementation that only trains the model on its first interaction with the environment while using a reward signal from its entire interaction.
+Read more about rollout functions here: https://huggingface.co/docs/trl/main/en/openenv
+"""
 
 def alfworld_rollout_first_prompt_and_completion(prompts: list[str], trainer, max_turns: int = 30) -> dict[str, list]:
     from trl.experimental.openenv import generate_rollout_completions

@@ -293,13 +293,12 @@ async def _evaluate_submissions(
         if task.task_type != TaskType.ENVIRONMENTTASK:
             test_data_filepath = await download_s3_file(task.test_data)
             test_results = await run_evaluation_docker_text(dataset=test_data_filepath, **evaluation_params)
+            try:
+                os.remove(test_data_filepath)
+            except Exception as e:
+                logger.warning(f"Failed to remove test data file {test_data_filepath}: {e}")
         else:
             test_results = await run_evaluation_docker_text(dataset="proxy", **evaluation_params)
-
-        try:
-            os.remove(test_data_filepath)
-        except Exception as e:
-            logger.warning(f"Failed to remove test data file {test_data_filepath}: {e}")
 
         test_eval_results = test_results.results
         task.model_params_count = test_results.base_model_params_count

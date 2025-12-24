@@ -33,7 +33,7 @@ core/config/*.toml
 !core/config/base_diffusion_flux.toml
 core/dataset/images/*
 !core/dataset/images/.gitkeep
-
+secure_checkpoints/
 
 *_keys.encrypted
 container_logs.txt

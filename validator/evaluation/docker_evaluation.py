@@ -9,7 +9,9 @@ import docker
 from docker.models.containers import Container
 from docker.types import Mount
 from huggingface_hub import snapshot_download
-
+import requests
+import time
+import random
 from core import constants as cst
 from core.models.payload_models import DockerEvaluationResults
 from core.models.payload_models import EvaluationResultImage
@@ -18,6 +20,7 @@ from core.models.utility_models import ChatTemplateDatasetType
 from core.models.utility_models import DpoDatasetType
 from core.models.utility_models import FileFormat
 from core.models.utility_models import GrpoDatasetType
+from core.models.utility_models import EnvironmentDatasetType
 from core.models.utility_models import ImageModelType
 from core.models.utility_models import InstructTextDatasetType
 from core.utils import download_s3_file
@@ -202,7 +205,7 @@ async def run_evaluation_docker_text(
     dataset: str,
     models: list[str],
     original_model: str,
-    dataset_type: InstructTextDatasetType | DpoDatasetType | GrpoDatasetType | ChatTemplateDatasetType,
+    dataset_type: InstructTextDatasetType | DpoDatasetType | GrpoDatasetType | ChatTemplateDatasetType | EnvironmentDatasetType,
     file_format: FileFormat,
     gpu_ids: list[int],
 ) -> DockerEvaluationResults:
@@ -213,6 +216,8 @@ async def run_evaluation_docker_text(
         command = ["python", "-m", "validator.evaluation.eval_dpo"]
     elif isinstance(dataset_type, GrpoDatasetType):
         return await run_evaluation_docker_grpo(dataset, models, original_model, dataset_type, file_format, gpu_ids)
+    elif isinstance(dataset_type, EnvironmentDatasetType):
+        return await run_evaluation_docker_environment(dataset, models, original_model, dataset_type, file_format, gpu_ids)
     else:
         raise ValueError(f"Unsupported dataset type: {type(dataset_type)}")
     task_type = type(dataset_type).__name__
@@ -387,6 +392,163 @@ async def run_evaluation_docker_grpo(
                 await cleanup_resources(client)
             except Exception as e:
                 logger.info(f"Problem with cleaning up container for {repo}: {e}")
+            client.close()
+
+    evaluation_results = normalize_rewards_and_compute_loss(evaluation_results)
+    logger.info(f"Grpo evaluation results post normalization: {evaluation_results}")
+    return process_evaluation_results(evaluation_results, is_image=False)
+
+
+async def run_evaluation_docker_environment(
+    dataset: str,
+    models: list[str],
+    original_model: str,
+    dataset_type: EnvironmentDatasetType,
+    file_format: FileFormat,
+    gpu_ids: list[int],
+) -> DockerEvaluationResults:
+    """
+    Run environment evaluation with separate containers for each model repo.
+    This approach launches one container per repo and merges results.
+    """
+
+    dataset_type_str = dataset_type.model_dump_json()
+    dataset_filename = os.path.basename(dataset)
+    dataset_dir = os.path.dirname(os.path.abspath(dataset))
+
+    # Shared environment settings
+    base_environment = {
+        "DATASET": f"/workspace/input_data/{dataset_filename}",
+        "ORIGINAL_MODEL": original_model,
+        "DATASET_TYPE": dataset_type_str,
+        "FILE_FORMAT": file_format.value,
+        "TRANSFORMERS_ALLOW_TORCH_LOAD": "true",
+        "HF_HOME": "/root/.cache/huggingface",
+        "TRANSFORMERS_CACHE": "/root/.cache/huggingface/hub",
+        "HF_DATASETS_CACHE": "/root/.cache/huggingface/datasets",
+    }
+
+    volume_bindings = {
+        dataset_dir: {
+            "bind": "/workspace/input_data",
+            "mode": "ro",
+        },
+        os.path.expanduser(cst.CACHE_DIR_HUB): {
+            "bind": "/root/.cache/huggingface/hub",
+            "mode": "rw",
+        }
+    }
+
+    logger.info(f"Starting sequential environment evaluation for {len(models)} repos: {models}")
+
+    evaluation_results = {}
+    for repo in models:
+
+        client = docker.from_env()
+        environment = base_environment.copy()
+        environment["MODELS"] = repo
+
+        containers = {}
+        all_results = []
+
+        # Start VLLM server for model inference
+        try:
+            # Docker Network Setup
+            networks = client.networks.list(names=["agent_eval_net"])
+            if not networks: client.networks.create("agent_eval_net", driver="bridge")
+            logger.info(f"Starting vLLM: {original_model} w/ lora {repo}")
+            vllm_command = f"--model {original_model} --enable-lora --lora-modules trained_lora={repo} --port 8000 --trust-remote-code"
+
+            vllm_container: Container = await asyncio.to_thread(
+                client.containers.run,
+                "vllm/vllm-openai:latest",
+                command=vllm_command,
+                volumes=volume_bindings,
+                runtime="nvidia",
+                device_requests=[docker.types.DeviceRequest(capabilities=[["gpu"]], device_ids=[str(gid) for gid in gpu_ids])],
+                detach=True,
+                network="agent_eval_net",
+                ports={'8000/tcp': 8000},
+            )
+            containers['vllm'] = vllm_container
+
+            logger.info("Starting AgentGym Server...")
+            environment_container: Container = await asyncio.to_thread(
+                client.containers.run,
+                "affinefoundation/agentgym:alfworld",
+                detach=True,
+                network="agent_eval_net",
+                ports={'8000/tcp': 8001} 
+            )
+            containers['agent'] = environment_container
+
+            logger.info("Waiting for vLLM health check...")
+            while True:
+                try:
+                    if requests.get("http://localhost:8000/v1/models", timeout=2).status_code == 200:
+                        break
+                except:
+                    time.sleep(5)
+            logger.info("vLLM Ready.\n")
+
+            # Evaluation Loop
+            NUM_EVALS = 500
+            DATA_LEN_RANGE = 2500
+            random.seed(42)
+            eval_list = random.sample(range(1, DATA_LEN_RANGE + 1), NUM_EVALS)
+            total_score = 0.0
+            total_time = 0.0
+
+            for i, task_id in enumerate(eval_list):
+                logger.info(f"[{i+1}/{NUM_EVALS}] Task ID: {task_id}...", end="", flush=True)
+
+                payload = {
+                    "model": "trained_lora",
+                    "base_url": "http://vllm-server:8000/v1",
+                    "task_id": task_id,
+                    "temperature": 0.0,
+                    "max_round": 30
+                }
+
+                try:
+                    start_ts = time.time()
+                    response = requests.post("http://localhost:8001/evaluate", json=payload, timeout=2500)
+                    result = response.json()
+
+                    latency = result.get('time_taken', time.time() - start_ts)
+                    score = result.get('score', 0.0)
+
+                    total_score += score
+                    total_time += latency
+
+                    all_results.append({
+                        "task_id": task_id,
+                        "task_name": result.get('task_name', 'unknown'),
+                        "score": score,
+                        "success": result.get('success', False),
+                        "time": latency,
+                        "error": result.get('error')
+                    })
+                    logger.info(f" Done (Score: {score})")
+                except Exception as e:
+                    logger.info(f" Failed: {e}")
+
+            # Final Aggregation & File Writing
+            avg_score = total_score / len(all_results) if all_results else 0
+            avg_time = total_time / len(all_results) if all_results else 0
+
+            evaluation_results[repo] = {'final_raw_rewards': {
+                'average_score_on_environment': avg_score
+            }}
+
+        except Exception as e:
+            logger.error(f"Failed to evaluate repo {repo}: {str(e)}", exc_info=True)
+            evaluation_results[repo] = str(e)
+            
+        finally:
+            for c in containers.values():
+                try: c.remove(force=True)
+                except: pass
             client.close()
 
     evaluation_results = normalize_rewards_and_compute_loss(evaluation_results)

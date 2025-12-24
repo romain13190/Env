@@ -407,6 +407,7 @@ async def create_synthetic_grpo_task(
     return task
 
 
+# NOTE: only alfworld env for now
 @retry_with_backoff
 async def create_synthetic_env_task(
     config: Config,
@@ -423,12 +424,14 @@ async def create_synthetic_env_task(
     current_time = datetime.utcnow()
     end_timestamp = current_time + timedelta(hours=number_of_hours)
 
+    selected_environment = "alfworld"
+
     yarn_factor = maybe_get_yarn_factor()
     task = EnvRawTask(
         model_id=model_id,
         ds=dataset.dataset_id,
         status=TaskStatus.PENDING,
-        environment_name="alfworld",
+        environment_name=selected_environment,
         is_organic=False,
         created_at=current_time,
         termination_at=end_timestamp,

@@ -15,7 +15,6 @@ import sys
 import yaml
 from transformers import AutoTokenizer
 
-
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.append(project_root)

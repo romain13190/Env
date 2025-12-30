@@ -211,7 +211,8 @@ async def main():
     elif args.task_type == TaskType.GRPOTASK.value:
         adapt_columns_for_grpo_dataset(dataset_path, dataset_type)
     elif args.task_type == TaskType.ENVIRONMENTTASK.value:
-        adapt_columns_for_environment_dataset(dataset_path, dataset_type)
+        #adapt_columns_for_environment_dataset(dataset_path, dataset_type) # NOTE: Remove to test RO cache
+        pass
     
     dataset_path = copy_dataset_to_axolotl_directories(dataset_path)
 

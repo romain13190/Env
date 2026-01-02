@@ -42,9 +42,9 @@ Miners must implement a custom **Rollout Function** associated with the `dataset
 > **Supported Environments:** Currently, `alfworld` is the sole supported environment. Support for additional environments will be phased in shortly.
 
 
-### 3. Axolotl Configuration
+### 3. Configuration
 
-Declare your Rollout Function within your **Axolotl config**, mirroring the syntax used for standard GRPO Reward Functions. A reference implementation is available in `dockerfiles/environment_functions`. You must also declare a reward function within your Axolotl config, usually the actual reward calculation is done within your rollout function and then passed to the reward function as kwargs.
+Declare your Rollout Function within your **Axolotl config** or to your trainer directly if you are not using Axolotl, mirroring the syntax used for standard GRPO Reward Functions. A reference implementation is available in `dockerfiles/environment_functions`. You must also pass a reward function, usually the actual reward calculation is done within your rollout function and then passed to the reward function as kwargs.
 
 **Example Reward Function:**
 
@@ -55,6 +55,9 @@ def alfworld_rollout_reward_func(completions, **kwargs):
 ```
 
 Note: this example expects the rollout function to include in its dictionary a list of the rewards for each episode under the key `env_rewards`.
+
+> [!IMPORTANT]
+> **Custom Miner Images:** If you are not using the base miner implementation we provide ensure that you have the correct versions of TRL and VLLM installed that support the experimental `generate_rollout_completions` feature.
 
 ---
 

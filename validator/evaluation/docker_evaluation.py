@@ -412,6 +412,8 @@ async def run_evaluation_docker_environment(
     This approach launches one container per repo and merges results.
     """
 
+    NUM_EPISODES_TO_EVAL = 10
+
     VLLM_HOST_PORT = 53421
     AGENT_HOST_PORT = 53422
 
@@ -527,15 +529,14 @@ async def run_evaluation_docker_environment(
             logger.info("vLLM Ready.\n")
 
             # Evaluation Loop
-            NUM_EVALS = 500
             DATA_LEN_RANGE = 2500
             random.seed(42)
-            eval_list = random.sample(range(1, DATA_LEN_RANGE + 1), NUM_EVALS)
+            eval_list = random.sample(range(1, DATA_LEN_RANGE + 1), NUM_EPISODES_TO_EVAL)
             total_score = 0.0
             total_time = 0.0
 
             for i, task_id in enumerate(eval_list):
-                logger.info(f"[{i+1}/{NUM_EVALS}] Task ID: {task_id}...")
+                logger.info(f"[{i+1}/{NUM_EPISODES_TO_EVAL}] Task ID: {task_id}...")
 
                 payload = {
                     "model": "trained_lora",

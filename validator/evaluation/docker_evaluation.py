@@ -217,7 +217,7 @@ async def run_evaluation_docker_text(
     elif isinstance(dataset_type, GrpoDatasetType):
         return await run_evaluation_docker_grpo(dataset, models, original_model, dataset_type, file_format, gpu_ids)
     elif isinstance(dataset_type, EnvironmentDatasetType):
-        return await run_evaluation_docker_environment(dataset, models, original_model, dataset_type, file_format, gpu_ids)
+        return await run_evaluation_docker_environment(dataset, models, original_model, dataset_type, file_format, gpu_ids, num_eval_samples=250)
     else:
         raise ValueError(f"Unsupported dataset type: {type(dataset_type)}")
     task_type = type(dataset_type).__name__
@@ -406,13 +406,12 @@ async def run_evaluation_docker_environment(
     dataset_type: EnvironmentDatasetType,
     file_format: FileFormat,
     gpu_ids: list[int],
+    num_eval_samples: int,
 ) -> DockerEvaluationResults:
     """
     Run environment evaluation with separate containers for each model repo.
     This approach launches one container per repo and merges results.
     """
-
-    NUM_EPISODES_TO_EVAL = 10
 
     VLLM_HOST_PORT = 53421
     AGENT_HOST_PORT = 53422
@@ -531,12 +530,12 @@ async def run_evaluation_docker_environment(
             # Evaluation Loop
             DATA_LEN_RANGE = 2500
             random.seed(42)
-            eval_list = random.sample(range(1, DATA_LEN_RANGE + 1), NUM_EPISODES_TO_EVAL)
+            eval_list = random.sample(range(1, DATA_LEN_RANGE + 1), num_eval_samples)
             total_score = 0.0
             total_time = 0.0
 
             for i, task_id in enumerate(eval_list):
-                logger.info(f"[{i+1}/{NUM_EPISODES_TO_EVAL}] Task ID: {task_id}...")
+                logger.info(f"[{i+1}/{num_eval_samples}] Task ID: {task_id}...")
 
                 payload = {
                     "model": "trained_lora",

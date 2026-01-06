@@ -570,7 +570,9 @@ async def run_evaluation_docker_environment(
 
             # Final Aggregation & File Writing
             avg_score = total_score / len(all_results) if all_results else 0
+            logger.info(f"Calculated average score of model to be: {avg_score}")
             avg_time = total_time / len(all_results) if all_results else 0
+            logger.info(f"Calculated average time of model to be: {avg_time}")
 
             evaluation_results[repo] = {
                 'is_finetune': True,

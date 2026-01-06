@@ -636,11 +636,127 @@ async def get_knockout_winners(
     return winners
 
 
-async def get_group_winners(
-    completed_round: TournamentRoundData, round_tasks: list[TournamentTask], psql_db: PSQLDB
+async def get_environment_group_winners(
+    completed_round: TournamentRoundData, round_tasks: list[TournamentTask], psql_db: PSQLDB, config: Config
 ) -> list[str]:
-    """Get winners from group round based on adjusted loss scores (top 8 performers)."""
-    TOP_WINNERS_TO_ADVANCE = 8
+    """Get winners from environment tournament group round with progressive threshold for boss.
+    Always returns exactly one winner."""
+    boss_hotkey = EMISSION_BURN_HOTKEY
+
+    for task in round_tasks:
+        group_id = task.group_id
+        task_id = task.task_id
+
+        logger.info(f"Processing environment tournament group {group_id} in round {completed_round.round_id}")
+
+        participants = await get_tournament_group_members(group_id, psql_db)
+        participant_hotkeys = [p.hotkey for p in participants]
+        logger.info(f"Group {group_id} and task {task_id} have {len(participant_hotkeys)} participants")
+
+        if not participant_hotkeys:
+            logger.warning(f"Group {group_id} has no participants, defaulting to boss as winner")
+            return [boss_hotkey]
+
+        miner_results = await get_task_results_for_ranking(task_id, psql_db)
+        if not miner_results:
+            logger.warning(f"No valid results for task {task_id}, defaulting to boss as winner")
+            return [boss_hotkey]
+
+        ranked_results = calculate_miner_ranking_and_scores(miner_results)
+
+        participant_scores = {}
+        boss_score = None
+        
+        for result in ranked_results:
+            hotkey = result.hotkey
+            adjusted_loss = result.adjusted_loss
+
+            if adjusted_loss is None or np.isnan(adjusted_loss):
+                continue
+
+            participant_scores[hotkey] = adjusted_loss
+            if hotkey == boss_hotkey:
+                boss_score = adjusted_loss
+
+        if not participant_scores:
+            logger.warning(f"Group {group_id} has no valid scores, defaulting to boss as winner")
+            return [boss_hotkey]
+
+        # Get tournament info and calculate progressive threshold
+        tournament = await get_tournament(completed_round.tournament_id, psql_db)
+        if not tournament:
+            logger.error(f"Could not find tournament {completed_round.tournament_id}, defaulting to boss as winner")
+            return [boss_hotkey]
+
+        current_champion = tournament.base_winner_hotkey or boss_hotkey
+        consecutive_wins = await count_champion_consecutive_wins(psql_db, tournament.tournament_type, current_champion)
+        threshold_percentage = get_progressive_threshold(consecutive_wins)
+        logger.info(
+            f"Environment tournament final round: Champion {current_champion} has {consecutive_wins} consecutive wins, "
+            f"using {threshold_percentage * 100:.1f}% threshold"
+        )
+
+        # Apply threshold logic: challengers must beat boss threshold to be eligible
+        if boss_score is not None:
+            boss_multiplier = 1 + threshold_percentage
+            boss_threshold_score = boss_score * boss_multiplier
+            
+            logger.info(
+                f"Boss score: {boss_score:.6f}, Threshold: {threshold_percentage * 100:.1f}%, "
+                f"Boss threshold score: {boss_threshold_score:.6f}"
+            )
+            
+            eligible_participants = {}
+            for hotkey, score in participant_scores.items():
+                if hotkey == boss_hotkey:
+                    eligible_participants[hotkey] = score
+                elif score >= boss_threshold_score:
+                    eligible_participants[hotkey] = score
+                    logger.info(
+                        f"Challenger {hotkey} beats boss threshold: {score:.6f} >= {boss_threshold_score:.6f}"
+                    )
+                else:
+                    logger.info(
+                        f"Challenger {hotkey} does not beat boss threshold: {score:.6f} < {boss_threshold_score:.6f}"
+                    )
+            
+            if len(eligible_participants) == 1 and boss_hotkey in eligible_participants:
+                logger.info(f"No challengers beat boss threshold. Boss {boss_hotkey} wins.")
+                return [boss_hotkey]
+            else:
+                participant_scores = eligible_participants
+        else:
+            logger.warning(f"Boss score not found for task {task_id}, proceeding without threshold")
+
+        # Sort descending for environment tasks (higher is better)
+        sorted_participants = sorted(participant_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        logger.info(
+            f"Group {group_id} participants sorted by adjusted loss (descending, higher is better): "
+            f"{[(hotkey, f'{loss:.6f}') for hotkey, loss in sorted_participants]}"
+        )
+
+        if sorted_participants:
+            winner = sorted_participants[0][0]
+            logger.info(f"Group {group_id}: Environment tournament winner: {winner}")
+            return [winner]
+
+    logger.warning(f"No winner found for environment tournament round {completed_round.round_id}, defaulting to boss")
+    return [boss_hotkey]
+
+
+async def get_group_winners(
+    completed_round: TournamentRoundData, round_tasks: list[TournamentTask], psql_db: PSQLDB, config: Config = None
+) -> list[str]:
+    """Get winners from group round based on adjusted loss scores (top 8 performers, or 1 for final rounds)."""
+
+    TOP_WINNERS_TO_ADVANCE = 1 if completed_round.is_final_round else 8
+
+    if completed_round.is_final_round:
+        task_object = await get_task(round_tasks[0].task_id, psql_db) if round_tasks else None
+        if task_object and task_object.task_type == TaskType.ENVIRONMENTTASK:
+            return await get_environment_group_winners(completed_round, round_tasks, psql_db, config)
+
     all_winners = []
 
     for task in round_tasks:
@@ -679,8 +795,10 @@ async def get_group_winners(
             continue
 
         sorted_participants = sorted(participant_scores.items(), key=lambda x: x[1])
+        ranking_direction = "ascending (lower is better)"
+        
         logger.info(
-            f"Group {group_id} participants sorted by adjusted loss: "
+            f"Group {group_id} participants sorted by adjusted loss ({ranking_direction}): "
             f"{[(hotkey, f'{loss:.6f}') for hotkey, loss in sorted_participants]}"
         )
 
@@ -700,7 +818,7 @@ async def get_round_winners(completed_round: TournamentRoundData, psql_db: PSQLD
     if completed_round.round_type == RoundType.KNOCKOUT:
         winners = await get_knockout_winners(completed_round, round_tasks, psql_db, config)
     else:
-        winners = await get_group_winners(completed_round, round_tasks, psql_db)
+        winners = await get_group_winners(completed_round, round_tasks, psql_db, config)
 
     # Ensure unique winners by converting to set and back to list
     unique_winners = list(set(winners))

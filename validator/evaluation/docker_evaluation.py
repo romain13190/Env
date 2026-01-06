@@ -597,8 +597,7 @@ async def run_evaluation_docker_environment(
                 except: pass
             client.close()
 
-    evaluation_results = normalize_rewards_and_compute_loss(evaluation_results)
-    logger.info(f"Environment evaluation results post normalization: {evaluation_results}")
+    logger.info(f"Environment evaluation results: {evaluation_results}")
     return process_evaluation_results(evaluation_results, is_image=False)
 
 

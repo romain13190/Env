@@ -9,7 +9,7 @@ from core.models.tournament_models import TournamentType
 
 async def get_training_repo(task_type: TournamentType) -> TrainingRepoResponse:
     return TrainingRepoResponse(
-        github_repo="https://github.com/rayonlabs/G.O.D", commit_hash="076e87fc746985e272015322cc91fb3bbbca2f26"
+        github_repo="https://github.com/rayonlabs/G.O.D", commit_hash="5f161f642cd578b829e72dedd8444a491b9bbca3"
     )
 
 
@@ -24,7 +24,7 @@ def factory_router() -> APIRouter:
         response_model=TrainingRepoResponse,
         summary="Get Training Repo",
         description="Retrieve the training repository and commit hash for the tournament.",
-        dependencies=[Depends(blacklist_low_stake), Depends(verify_get_request)],
+        # dependencies=[Depends(blacklist_low_stake), Depends(verify_get_request)],
     )
 
     return router

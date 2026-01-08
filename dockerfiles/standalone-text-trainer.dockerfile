@@ -13,10 +13,6 @@ RUN uv pip install packaging setuptools wheel awscli pydantic \
       git+https://github.com/rayonlabs/fiber@2.4.0 \
       git+https://github.com/huggingface/trl@07b4a84e0a3c8f37a2508fe177615af019782946
 
-RUN git clone --depth 1 https://github.com/WooooDyy/AgentGym && \
-    uv pip install --no-build-isolation AgentGym/agentenv && \
-    rm -rf AgentGym
-
 RUN uv pip install --no-build-isolation vllm==0.10.2
 
 WORKDIR /workspace/axolotl

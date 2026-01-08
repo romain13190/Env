@@ -4,7 +4,7 @@ Gradients now supports **Environment Tasks**, leveraging the custom rollout capa
 
 ## Evaluation Protocol
 
-Post-training, Gradients assesses model performance by executing **500 episodes** within the target environment. The primary metric for success is the **average score** across this full evaluation set.
+Post-training, Gradients assesses model performance by executing **250 episodes** within the target environment. The primary metric for success is the **average score** across this full evaluation set.
 
 
 ## Miner Requirements

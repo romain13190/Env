@@ -554,7 +554,7 @@ async def populate_tournament_participants(tournament_id: str, config: Config, p
         fee_description = "0.15 TAO"
     elif tournament.tournament_type == TournamentType.ENVIRONMENT:
         participation_fee_rao = t_cst.TOURNAMENT_ENVIRONMENT_PARTICIPATION_FEE_RAO
-        fee_description = "0.2 TAO"
+        fee_description = "0.25 TAO"
     else:
         raise ValueError(f"Unknown tournament type: {tournament.tournament_type}")
 
@@ -680,7 +680,7 @@ async def populate_tournament_participants(tournament_id: str, config: Config, p
         logger.info(f"Successfully populated {miners_that_accept_and_give_repos} participants for tournament {tournament_id}")
 
         if tournament.tournament_type == TournamentType.ENVIRONMENT:
-            min_required_miners = 4
+            min_required_miners = cst.MIN_MINERS_FOR_ENV_TOURN
         else:
             min_required_miners = cst.MIN_MINERS_FOR_TOURN
 

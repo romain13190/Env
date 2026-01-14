@@ -50,7 +50,8 @@ def get_axolotl_dataset_paths(dataset_filename: str) -> tuple[str, str]:
 def get_axolotl_base_config_path(dataset_type) -> str:
     root_dir = Path(train_cst.AXOLOTL_DIRECTORIES["root"])
     if isinstance(dataset_type, EnvironmentDatasetType):
-        return str(root_dir / "base_environment.yml")
+        # EnvTask → SFT-only config
+        return str(root_dir / "base_env_sft.yml")
     elif isinstance(dataset_type, (InstructTextDatasetType, DpoDatasetType, ChatTemplateDatasetType)):
         return str(root_dir / "base.yml")
     elif isinstance(dataset_type, GrpoDatasetType):

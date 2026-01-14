@@ -13,6 +13,7 @@ RUN uv pip install packaging setuptools wheel awscli pydantic \
       git+https://github.com/rayonlabs/fiber@2.4.0 \
       git+https://github.com/huggingface/trl@07b4a84e0a3c8f37a2508fe177615af019782946
 
+RUN uv pip install --no-build-isolation "flash-attn==2.6.3"
 RUN uv pip install --no-build-isolation vllm==0.10.2
 
 WORKDIR /workspace/axolotl
@@ -30,6 +31,8 @@ COPY scripts /workspace/scripts
 COPY core/config/base.yml /workspace/axolotl/base.yml
 COPY core/config/base_grpo.yml /workspace/axolotl/base_grpo.yml
 COPY core/config/base_environment.yml /workspace/axolotl/base_environment.yml
+COPY core/config/base_env_sft.yml /workspace/axolotl/base_env_sft.yml
+COPY data /workspace/data
 
 RUN chmod +x /workspace/scripts/run_text_trainer.sh /workspace/scripts/text_trainer.py
 

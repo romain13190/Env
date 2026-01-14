@@ -13,7 +13,13 @@ import subprocess
 import sys
 
 import yaml
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM
+from transformers import DataCollatorForLanguageModeling
+from transformers import Trainer, TrainingArguments
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
@@ -35,6 +41,9 @@ from core.models.utility_models import EnvironmentDatasetType
 from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import TaskType
 from core.config.config_handler import create_reward_funcs_file
+
+
+ENV_SFT_DATA_PATH = "/workspace/data/alfworld_auto_task_0_2500.jsonl"
 
 
 def patch_wandb_symlinks(base_dir: str):
@@ -111,12 +120,6 @@ def create_config(task_id, model, dataset, dataset_type, file_format, output_dir
         )
         config["trl"]["reward_funcs"] = [f"{filename}.{func_name}" for func_name in reward_funcs_names]
         config["trl"]["reward_weights"] = [reward_function.reward_weight for reward_function in dataset_type.reward_functions]
-    elif isinstance(dataset_type, EnvironmentDatasetType):
-        # Switch based on the environment
-        if dataset_type.environment_name == "alfworld":
-            config["trl"]["rollout_func"] = "alfworld.alfworld_rollout_first_prompt_and_completion"
-            config["trl"]["reward_funcs"] = ["alfworld.alfworld_rollout_reward_func"]
-            config["trl"]["reward_weights"] = [1.0]
 
     if file_format != FileFormat.HF.value:
         for ds in config["datasets"]:
@@ -188,6 +191,9 @@ async def main():
     parser.add_argument("--hours-to-complete", type=float, required=True, help="Number of hours to complete the task")
     args = parser.parse_args()
 
+    # Default file format; may be overridden for EnvTask
+    file_format = args.file_format
+
     for directory in train_cst.AXOLOTL_DIRECTORIES.values():
         os.makedirs(directory, exist_ok=True)
     try:
@@ -203,19 +209,26 @@ async def main():
             dataset_type = GrpoDatasetType(**dataset_type_dict)
         elif args.task_type == TaskType.ENVIRONMENTTASK.value:
             dataset_type = EnvironmentDatasetType(**dataset_type_dict)
+            file_format = FileFormat.JSON.value
         else:
             sys.exit(f"Unsupported task type: {args.task_type}")
     except Exception as e:
         sys.exit(f"Error creating dataset type object: {e}")
+
+    # EnvTask → SFT-only path
+    if args.task_type == TaskType.ENVIRONMENTTASK.value:
+        dataset_path = ENV_SFT_DATA_PATH
+        output_dir = train_paths.get_checkpoints_output_path(args.task_id, args.expected_repo_name)
+        model_path = train_paths.get_text_base_model_path(args.model)
+        run_envtask_sft(dataset_path, model_path, output_dir)
+        patch_wandb_symlinks(train_cst.WANDB_LOGS_DIR)
+        return
 
     dataset_path = train_paths.get_text_dataset_path(args.task_id)
     if args.task_type == TaskType.DPOTASK.value:
         adapt_columns_for_dpo_dataset(dataset_path, dataset_type, apply_formatting=True)
     elif args.task_type == TaskType.GRPOTASK.value:
         adapt_columns_for_grpo_dataset(dataset_path, dataset_type)
-    elif args.task_type == TaskType.ENVIRONMENTTASK.value:
-        #adapt_columns_for_environment_dataset(dataset_path, dataset_type) # NOTE: Remove to test RO cache
-        pass
     
     dataset_path = copy_dataset_to_axolotl_directories(dataset_path)
 
@@ -228,7 +241,7 @@ async def main():
         args.model,
         dataset_path,
         dataset_type,
-        args.file_format,
+        file_format,
         output_dir,
         args.expected_repo_name,
         log_wandb=True,
@@ -237,6 +250,137 @@ async def main():
     run_training(config_path)
 
     patch_wandb_symlinks(train_cst.WANDB_LOGS_DIR)
+
+
+def run_envtask_sft(
+    dataset_path: str,
+    model_path: str,
+    output_dir: str,
+    max_seq_len: int = 4096,
+    hard_frac: float = 0.2,
+    hard_upsample: int = 2,
+    eval_batch_size: int = 4,
+):
+    print(f"[EnvTask-SFT] Loading model from {model_path}", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, device_map="auto")
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+    # Prefer flash attention if available, otherwise fall back to sdpa
+    try:
+        model.config.attn_implementation = "flash_attention_2"
+    except Exception:
+        model.config.attn_implementation = "sdpa"
+
+    print(f"[EnvTask-SFT] Loading dataset from {dataset_path}", flush=True)
+    raw_ds = load_dataset("json", data_files=dataset_path)
+
+    def format_example(ex):
+        instruction = ex.get("instruction", "")
+        output = ex.get("output", "")
+        prompt = f"Instruction:\n{instruction}\n\nAnswer:\n"
+        return {"text": prompt + output}
+
+    formatted = raw_ds.map(format_example, remove_columns=raw_ds["train"].column_names)
+
+    def tokenize(batch):
+        tokens = tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=max_seq_len,
+            padding="max_length",
+        )
+        labels = []
+        for ids, mask in zip(tokens["input_ids"], tokens["attention_mask"]):
+            labels.append([tok if m == 1 else -100 for tok, m in zip(ids, mask)])
+        tokens["labels"] = labels
+        return tokens
+
+    tokenized = formatted.map(tokenize, batched=True, remove_columns=["text"])
+
+    def upweight_hard_examples(train_ds):
+        if hard_frac <= 0 or hard_upsample <= 1:
+            return train_ds
+
+        print(f"[EnvTask-SFT] Hard mining start (top {int(hard_frac*100)}%)", flush=True)
+        model.eval()
+        device = model.device
+        losses = []
+
+        for start in range(0, len(train_ds), eval_batch_size):
+            batch = train_ds[start : start + eval_batch_size]
+            input_ids = torch.tensor(batch["input_ids"], device=device)
+            attention_mask = torch.tensor(batch["attention_mask"], device=device)
+            labels = torch.tensor(batch["labels"], device=device)
+
+            with torch.no_grad():
+                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            shift_mask = attention_mask[..., 1:].contiguous()
+
+            token_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction="none",
+                ignore_index=-100,
+            ).view(shift_labels.size())
+
+            seq_loss = (token_loss * shift_mask).sum(dim=1) / shift_mask.sum(dim=1).clamp(min=1)
+            losses.extend(seq_loss.detach().cpu().tolist())
+
+        model.train()
+
+        if not losses:
+            return train_ds
+
+        k = max(1, int(len(losses) * hard_frac))
+        top_indices = sorted(range(len(losses)), key=lambda i: losses[i], reverse=True)[:k]
+        hard_ds = train_ds.select(top_indices)
+
+        augmented = [train_ds] + [hard_ds for _ in range(hard_upsample - 1)]
+        mixed = concatenate_datasets(augmented)
+        print(
+            f"[EnvTask-SFT] Hard mining done: selected {k} hard samples, upsampled x{hard_upsample}, final size {len(mixed)}",
+            flush=True,
+        )
+        return mixed
+
+    # Hard mining can be toggled later; for now, train on the base dataset
+    mined_train = tokenized["train"]
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    os.makedirs(output_dir, exist_ok=True)
+    args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        num_train_epochs=2,
+        learning_rate=4e-5,
+        logging_steps=10,
+        save_steps=200,
+        gradient_checkpointing=True,
+        fp16=False,
+        bf16=True,
+        report_to=[],
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=mined_train,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+    )
+
+    print("[EnvTask-SFT] Starting training...", flush=True)
+    trainer.train()
+    print("[EnvTask-SFT] Saving model...", flush=True)
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print("[EnvTask-SFT] Done.", flush=True)
 
 
 if __name__ == "__main__":

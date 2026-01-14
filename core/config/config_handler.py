@@ -75,7 +75,16 @@ def _process_grpo_dataset_fields(dataset_type: GrpoDatasetType) -> dict:
 
 
 def _process_environment_dataset_fields(dataset_type: EnvironmentDatasetType) -> dict:
-    return {"split": "train"}
+    # Treat EnvTask as custom instruct-style data (SFT-only).
+    processed_dict = {
+        "field_instruction": "instruction",
+        "field_input": None,
+        "field_output": "output",
+        "field_system": None,
+        "format": "{instruction}",
+        "no_input_format": "{instruction}",
+    }
+    return {"format": "custom", "type": processed_dict, "split": "train"}
 
 
 def _process_dpo_dataset_fields(dataset_type: DpoDatasetType) -> dict:

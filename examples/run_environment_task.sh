@@ -7,7 +7,7 @@ DATASET_TYPE='{
   "environment_name": "alfworld"
 }'
 FILE_FORMAT="s3"
-HOURS_TO_COMPLETE=12
+HOURS_TO_COMPLETE=5
 
 # For uploading the outputs
 HUGGINGFACE_TOKEN="Your Huggingface Token"

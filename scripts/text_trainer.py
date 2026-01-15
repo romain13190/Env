@@ -16,9 +16,11 @@ import yaml
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset, concatenate_datasets
+from datasets import Dataset
 from transformers import AutoTokenizer
 from transformers import AutoModelForCausalLM
 from transformers import DataCollatorForLanguageModeling
+from transformers import default_data_collator
 from transformers import Trainer, TrainingArguments
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -263,7 +265,16 @@ def run_envtask_sft(
 ):
     print(f"[EnvTask-SFT] Loading model from {model_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, device_map="auto")
+    if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
+        model.resize_token_embeddings(len(tokenizer))
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     # Prefer flash attention if available, otherwise fall back to sdpa
@@ -275,28 +286,83 @@ def run_envtask_sft(
     print(f"[EnvTask-SFT] Loading dataset from {dataset_path}", flush=True)
     raw_ds = load_dataset("json", data_files=dataset_path)
 
-    def format_example(ex):
-        instruction = ex.get("instruction", "")
-        output = ex.get("output", "")
-        prompt = f"Instruction:\n{instruction}\n\nAnswer:\n"
-        return {"text": prompt + output}
+    def _serialize_msgs(msgs):
+        parts = []
+        for m in msgs:
+            role = (m.get("role") or "").strip().upper()
+            content = m.get("content") or ""
+            if not role or not content:
+                continue
+            parts.append(f"{role}:\n{content}")
+        return "\n\n".join(parts)
 
-    formatted = raw_ds.map(format_example, remove_columns=raw_ds["train"].column_names)
+    def _episode_to_pairs(ex):
+        # Supported formats:
+        # 1) {"instruction": ..., "output": ...}
+        # 2) {"response": {"extra": {"conversation": [...]}}} (alfworld logs)
+        if "instruction" in ex or "output" in ex:
+            instruction = ex.get("instruction", "") or ""
+            output = ex.get("output", "") or ""
+            prompt = f"Instruction:\n{instruction}\n\nAnswer:\n"
+            return [{"prompt": prompt, "completion": output}]
+
+        conv = (((ex.get("response") or {}).get("extra") or {}).get("conversation")) or ex.get("conversation")
+        if not isinstance(conv, list):
+            return []
+
+        pairs = []
+        for i, m in enumerate(conv):
+            if (m.get("role") or "").strip().lower() != "assistant":
+                continue
+            completion = (m.get("content") or "").strip()
+            if not completion:
+                continue
+            # Skip the trivial initial acknowledgement if present
+            if i <= 1 and completion.lower().startswith("ok"):
+                continue
+            prompt = _serialize_msgs(conv[:i]) + "\n\nASSISTANT:\n"
+            if prompt.strip() and completion.strip():
+                pairs.append({"prompt": prompt, "completion": completion})
+        return pairs
+
+    # Materialize pairs in-memory (dataset is small ~2.5k episodes)
+    pairs = []
+    for ex in raw_ds["train"]:
+        pairs.extend(_episode_to_pairs(ex))
+    formatted = Dataset.from_list(pairs)
 
     def tokenize(batch):
-        tokens = tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=max_seq_len,
-            padding="max_length",
-        )
+        input_ids = []
+        attention_mask = []
         labels = []
-        for ids, mask in zip(tokens["input_ids"], tokens["attention_mask"]):
-            labels.append([tok if m == 1 else -100 for tok, m in zip(ids, mask)])
-        tokens["labels"] = labels
-        return tokens
 
-    tokenized = formatted.map(tokenize, batched=True, remove_columns=["text"])
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id
+
+        for prompt, completion in zip(batch["prompt"], batch["completion"]):
+            p_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            c_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
+            if eos_id is not None:
+                c_ids = c_ids + [eos_id]
+
+            ids = (p_ids + c_ids)[:max_seq_len]
+            p_len = min(len(p_ids), max_seq_len)
+            lab = ([-100] * p_len + ids[p_len:])[:max_seq_len]
+
+            attn = [1] * len(ids)
+            if len(ids) < max_seq_len:
+                pad_len = max_seq_len - len(ids)
+                ids = ids + [pad_id] * pad_len
+                attn = attn + [0] * pad_len
+                lab = lab + [-100] * pad_len
+
+            input_ids.append(ids)
+            attention_mask.append(attn)
+            labels.append(lab)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+    tokenized = formatted.map(tokenize, batched=True, remove_columns=formatted.column_names)
 
     def upweight_hard_examples(train_ds):
         if hard_frac <= 0 or hard_upsample <= 1:
@@ -350,7 +416,7 @@ def run_envtask_sft(
     # Hard mining can be toggled later; for now, train on the base dataset
     mined_train = tokenized["train"]
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    data_collator = default_data_collator
 
     os.makedirs(output_dir, exist_ok=True)
     args = TrainingArguments(

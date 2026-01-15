@@ -50,7 +50,7 @@ docker run --rm --gpus all \
   --cpus=8 \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
-  --name grpo-text-trainer-example \
+  --name env-sft-text-trainer-example \
   standalone-text-trainer \
   --task-id "$TASK_ID" \
   --model "$MODEL" \

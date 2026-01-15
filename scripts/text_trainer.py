@@ -16,12 +16,12 @@ import yaml
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset, concatenate_datasets
-from datasets import Dataset
 from transformers import AutoTokenizer
 from transformers import AutoModelForCausalLM
 from transformers import DataCollatorForLanguageModeling
 from transformers import default_data_collator
 from transformers import Trainer, TrainingArguments
+from typing import Any, Dict, List, Optional
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
@@ -32,6 +32,7 @@ import trainer.utils.training_paths as train_paths
 from core.config.config_handler import create_dataset_entry
 from core.config.config_handler import save_config
 from core.config.config_handler import update_flash_attention
+from core.alfworld_eval_ids import alfworld_eval_task_ids
 from core.dataset_utils import adapt_columns_for_dpo_dataset
 from core.dataset_utils import adapt_columns_for_grpo_dataset
 from core.dataset_utils import adapt_columns_for_environment_dataset
@@ -191,6 +192,11 @@ async def main():
     parser.add_argument("--file-format", required=True, choices=["csv", "json", "hf", "s3"], help="File format")
     parser.add_argument("--expected-repo-name", help="Expected repository name")
     parser.add_argument("--hours-to-complete", type=float, required=True, help="Number of hours to complete the task")
+    parser.add_argument(
+        "--env-eval-only",
+        action="store_true",
+        help="(EnvTask only) Train only on the fixed 250 AlfWorld task_ids used during validator evaluation.",
+    )
     args = parser.parse_args()
 
     # Default file format; may be overridden for EnvTask
@@ -222,7 +228,8 @@ async def main():
         dataset_path = ENV_SFT_DATA_PATH
         output_dir = train_paths.get_checkpoints_output_path(args.task_id, args.expected_repo_name)
         model_path = train_paths.get_text_base_model_path(args.model)
-        run_envtask_sft(dataset_path, model_path, output_dir)
+        allowed_ids = set(alfworld_eval_task_ids()) if args.env_eval_only else None
+        run_envtask_sft(dataset_path, model_path, output_dir, allowed_task_ids=allowed_ids)
         patch_wandb_symlinks(train_cst.WANDB_LOGS_DIR)
         return
 
@@ -262,6 +269,7 @@ def run_envtask_sft(
     hard_frac: float = 0.2,
     hard_upsample: int = 2,
     eval_batch_size: int = 4,
+    allowed_task_ids: Optional[set[int]] = None,
 ):
     print(f"[EnvTask-SFT] Loading model from {model_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -284,139 +292,176 @@ def run_envtask_sft(
         model.config.attn_implementation = "sdpa"
 
     print(f"[EnvTask-SFT] Loading dataset from {dataset_path}", flush=True)
-    raw_ds = load_dataset("json", data_files=dataset_path)
+    raw_ds = load_dataset("json", data_files=dataset_path, split="train")
+    if allowed_task_ids:
+        allowed = set(int(x) for x in allowed_task_ids)
 
-    def _serialize_msgs(msgs):
+        def _keep(ex: Dict[str, Any]) -> bool:
+            tid = ex.get("id")
+            if tid is None:
+                tid = (ex.get("request") or {}).get("task_id")
+            try:
+                return int(tid) in allowed
+            except Exception:
+                return False
+
+        before = len(raw_ds)
+        raw_ds = raw_ds.filter(_keep)
+        print(f"[EnvTask-SFT] Filtered dataset to {len(raw_ds)}/{before} rows (eval-only)", flush=True)
+
+    def _format_messages_to_text(tok, messages, add_generation_prompt: bool = False) -> str:
+        # Prefer the model's chat template when available; fall back to a simple serialization otherwise.
+        if hasattr(tok, "apply_chat_template"):
+            try:
+                return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+            except Exception:
+                pass
         parts = []
-        for m in msgs:
+        for m in messages or []:
             role = (m.get("role") or "").strip().upper()
-            content = m.get("content") or ""
-            if not role or not content:
-                continue
-            parts.append(f"{role}:\n{content}")
+            content = (m.get("content") or "").strip()
+            if role and content:
+                parts.append(f"{role}:\n{content}")
+        if add_generation_prompt:
+            parts.append("ASSISTANT:\n")
         return "\n\n".join(parts)
 
-    def _episode_to_pairs(ex):
+    def _find_last_subsequence(haystack_ids: List[int], needle_ids: List[int]) -> Optional[int]:
+        if not needle_ids:
+            return None
+        H, N = len(haystack_ids), len(needle_ids)
+        if N > H:
+            return None
+        for i in range(H - N, -1, -1):
+            if haystack_ids[i : i + N] == needle_ids:
+                return i
+        return None
+
+    def _extract_messages(ex: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         # Supported formats:
         # 1) {"instruction": ..., "output": ...}
         # 2) {"response": {"extra": {"conversation": [...]}}} (alfworld logs)
+        # 3) {"conversation": [...]} or {"messages": [...]}
+        if isinstance(ex.get("conversation"), list):
+            return ex.get("conversation")
+        if isinstance(ex.get("messages"), list):
+            return ex.get("messages")
+        conv = (((ex.get("response") or {}).get("extra") or {}).get("conversation"))
+        if isinstance(conv, list):
+            return conv
         if "instruction" in ex or "output" in ex:
-            instruction = ex.get("instruction", "") or ""
-            output = ex.get("output", "") or ""
-            prompt = f"Instruction:\n{instruction}\n\nAnswer:\n"
-            return [{"prompt": prompt, "completion": output}]
+            instruction = (ex.get("instruction") or "").strip()
+            output = (ex.get("output") or "").strip()
+            if not instruction or not output:
+                return None
+            return [{"role": "user", "content": instruction}, {"role": "assistant", "content": output}]
+        return None
 
-        conv = (((ex.get("response") or {}).get("extra") or {}).get("conversation")) or ex.get("conversation")
-        if not isinstance(conv, list):
-            return []
+    class AssistantOnlyCollator:
+        """
+        Episode-level collator:
+        - builds (prompt_context + assistant_answer + EOS) using chat template
+        - labels only assistant_answer(+EOS) tokens, masks everything else with -100
+        - if too long, truncates from the LEFT but keeps the entire assistant answer
+        """
 
-        pairs = []
-        for i, m in enumerate(conv):
-            if (m.get("role") or "").strip().lower() != "assistant":
-                continue
-            completion = (m.get("content") or "").strip()
-            if not completion:
-                continue
-            # Skip the trivial initial acknowledgement if present
-            if i <= 1 and completion.lower().startswith("ok"):
-                continue
-            prompt = _serialize_msgs(conv[:i]) + "\n\nASSISTANT:\n"
-            if prompt.strip() and completion.strip():
-                pairs.append({"prompt": prompt, "completion": completion})
-        return pairs
+        def __init__(self, tok, max_length: int, max_assistant_responses: int = 30):
+            self.tok = tok
+            self.max_length = int(max_length)
+            self.max_assistant_responses = int(max_assistant_responses)
+            if self.tok.pad_token_id is None:
+                self.tok.pad_token = self.tok.eos_token
+            self.pad_id = int(self.tok.pad_token_id)
 
-    # Materialize pairs in-memory (dataset is small ~2.5k episodes)
-    pairs = []
-    for ex in raw_ds["train"]:
-        pairs.extend(_episode_to_pairs(ex))
-    formatted = Dataset.from_list(pairs)
+        def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+            all_input_ids: List[List[int]] = []
+            all_labels: List[List[int]] = []
 
-    def tokenize(batch):
-        input_ids = []
-        attention_mask = []
-        labels = []
+            eos_tok = getattr(self.tok, "eos_token", None) or ""
 
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id
+            for ex in batch:
+                messages = _extract_messages(ex)  # type: ignore[arg-type]
+                if not isinstance(messages, list) or not messages:
+                    continue
 
-        for prompt, completion in zip(batch["prompt"], batch["completion"]):
-            p_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            c_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
-            if eos_id is not None:
-                c_ids = c_ids + [eos_id]
+                assistant_indices = [
+                    i for i, m in enumerate(messages) if (m.get("role") or "").strip().lower() == "assistant"
+                ]
+                if not assistant_indices:
+                    continue
 
-            ids = (p_ids + c_ids)[:max_seq_len]
-            p_len = min(len(p_ids), max_seq_len)
-            lab = ([-100] * p_len + ids[p_len:])[:max_seq_len]
+                for idx in assistant_indices[: self.max_assistant_responses]:
+                    assistant_content = (messages[idx].get("content") or "").strip()
+                    if not assistant_content:
+                        continue
+                    # Keep the existing heuristic: skip trivial early "ok" acknowledgements.
+                    if idx <= 1 and assistant_content.lower().startswith("ok"):
+                        continue
 
-            attn = [1] * len(ids)
-            if len(ids) < max_seq_len:
-                pad_len = max_seq_len - len(ids)
-                ids = ids + [pad_id] * pad_len
-                attn = attn + [0] * pad_len
-                lab = lab + [-100] * pad_len
+                    assistant_text = assistant_content + eos_tok
+                    prompt_text = _format_messages_to_text(self.tok, messages[:idx], add_generation_prompt=True)
+                    full_text = prompt_text + assistant_text
 
-            input_ids.append(ids)
-            attention_mask.append(attn)
-            labels.append(lab)
+                    enc = self.tok(full_text, add_special_tokens=False, truncation=False, return_tensors=None)
+                    ids = enc.get("input_ids") or []
+                    if not ids:
+                        continue
 
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+                    assistant_ids = self.tok.encode(assistant_text, add_special_tokens=False)
+                    if not assistant_ids:
+                        continue
+                    if len(assistant_ids) > self.max_length:
+                        # Shouldn't happen per your assumption; skip defensively.
+                        continue
 
-    tokenized = formatted.map(tokenize, batched=True, remove_columns=formatted.column_names)
+                    start = _find_last_subsequence(ids, assistant_ids)
+                    if start is None:
+                        start = len(ids) - len(assistant_ids)
+                        if start < 0:
+                            continue
+                    end = start + len(assistant_ids)
 
-    def upweight_hard_examples(train_ds):
-        if hard_frac <= 0 or hard_upsample <= 1:
-            return train_ds
+                    # Truncate from the LEFT, keeping the entire assistant answer.
+                    if len(ids) > self.max_length:
+                        w_end = end
+                        w_start = max(0, w_end - self.max_length)
+                        ids = ids[w_start:w_end]
+                        start -= w_start
+                        end = start + len(assistant_ids)
 
-        print(f"[EnvTask-SFT] Hard mining start (top {int(hard_frac*100)}%)", flush=True)
-        model.eval()
-        device = model.device
-        losses = []
+                    labels = [-100] * len(ids)
+                    if 0 <= start < end <= len(ids):
+                        labels[start:end] = ids[start:end]
+                    else:
+                        continue
 
-        for start in range(0, len(train_ds), eval_batch_size):
-            batch = train_ds[start : start + eval_batch_size]
-            input_ids = torch.tensor(batch["input_ids"], device=device)
-            attention_mask = torch.tensor(batch["attention_mask"], device=device)
-            labels = torch.tensor(batch["labels"], device=device)
+                    all_input_ids.append(ids)
+                    all_labels.append(labels)
 
-            with torch.no_grad():
-                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            if not all_input_ids:
+                dummy = torch.tensor([[self.pad_id]], dtype=torch.long)
+                return {
+                    "input_ids": dummy,
+                    "attention_mask": torch.ones_like(dummy),
+                    "labels": torch.full_like(dummy, -100),
+                }
 
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            shift_mask = attention_mask[..., 1:].contiguous()
+            max_len = max(len(x) for x in all_input_ids)
+            bsz = len(all_input_ids)
+            input_ids_tensor = torch.full((bsz, max_len), self.pad_id, dtype=torch.long)
+            attention_mask = torch.zeros((bsz, max_len), dtype=torch.long)
+            labels_tensor = torch.full((bsz, max_len), -100, dtype=torch.long)
 
-            token_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                reduction="none",
-                ignore_index=-100,
-            ).view(shift_labels.size())
+            for i, (ids, lbls) in enumerate(zip(all_input_ids, all_labels)):
+                L = len(ids)
+                input_ids_tensor[i, :L] = torch.tensor(ids, dtype=torch.long)
+                attention_mask[i, :L] = 1
+                labels_tensor[i, :L] = torch.tensor(lbls, dtype=torch.long)
 
-            seq_loss = (token_loss * shift_mask).sum(dim=1) / shift_mask.sum(dim=1).clamp(min=1)
-            losses.extend(seq_loss.detach().cpu().tolist())
+            return {"input_ids": input_ids_tensor, "attention_mask": attention_mask, "labels": labels_tensor}
 
-        model.train()
-
-        if not losses:
-            return train_ds
-
-        k = max(1, int(len(losses) * hard_frac))
-        top_indices = sorted(range(len(losses)), key=lambda i: losses[i], reverse=True)[:k]
-        hard_ds = train_ds.select(top_indices)
-
-        augmented = [train_ds] + [hard_ds for _ in range(hard_upsample - 1)]
-        mixed = concatenate_datasets(augmented)
-        print(
-            f"[EnvTask-SFT] Hard mining done: selected {k} hard samples, upsampled x{hard_upsample}, final size {len(mixed)}",
-            flush=True,
-        )
-        return mixed
-
-    # Hard mining can be toggled later; for now, train on the base dataset
-    mined_train = tokenized["train"]
-
-    data_collator = default_data_collator
+    if hard_frac > 0:
+        print("[EnvTask-SFT] Note: hard mining is currently disabled in assistant-only mode.", flush=True)
 
     os.makedirs(output_dir, exist_ok=True)
     args = TrainingArguments(
@@ -426,19 +471,22 @@ def run_envtask_sft(
         num_train_epochs=2,
         learning_rate=4e-5,
         logging_steps=10,
-        save_steps=200,
+        logging_first_step=True,
+        disable_tqdm=True,
+        save_strategy="no",
         gradient_checkpointing=True,
         fp16=False,
         bf16=True,
         report_to=[],
+        remove_unused_columns=False,
     )
 
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=mined_train,
+        train_dataset=raw_ds,
         tokenizer=tokenizer,
-        data_collator=data_collator,
+        data_collator=AssistantOnlyCollator(tokenizer, max_length=max_seq_len),
     )
 
     print("[EnvTask-SFT] Starting training...", flush=True)

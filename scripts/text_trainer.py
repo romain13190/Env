@@ -5,6 +5,7 @@ Standalone script for text model training (InstructText, DPO, and GRPO)
 
 import argparse
 import asyncio
+from collections import Counter
 import json
 import math
 import os
@@ -49,6 +50,21 @@ from core.config.config_handler import create_reward_funcs_file
 
 
 ENV_SFT_DATA_PATH = "/workspace/data/alfworld_auto_task_0_2500.jsonl"
+
+# EnvTask training defaults (edit here instead of passing CLI flags)
+ENV_TASK_DEFAULTS = {
+    # If max_epochs <= 0, we use deterministic_max_epochs / nondeterministic_max_epochs depending on TRAIN_DETERMINISTIC.
+    "max_epochs": 0.0,
+    "deterministic_max_epochs": 30.0,
+    "nondeterministic_max_epochs": 2.0,
+    # Hard-mining schedule (only used when deterministic=True)
+    "hard_mining_start_epoch": 2.0,   # 0 disables hard mining
+    "hard_mining_every_epochs": 3.0,  # 0 mines once, >0 mines periodically
+    # Data / packing controls
+    "max_seq_len": 4096,
+    "max_assistant_responses": 10,
+    "min_prev_assistant_tokens": 200,
+}
 
 
 def parse_thresholds(threshold_str: str) -> List[tuple[float, int]]:
@@ -224,8 +240,14 @@ async def main():
     parser.add_argument(
         "--hard-mining-start-epoch",
         type=float,
-        default=0.0,
+        default=ENV_TASK_DEFAULTS["hard_mining_start_epoch"],
         help="(EnvTask deterministic only) Epoch to start hard mining; 0 disables it.",
+    )
+    parser.add_argument(
+        "--hard-mining-every-epochs",
+        type=float,
+        default=ENV_TASK_DEFAULTS["hard_mining_every_epochs"],
+        help="(EnvTask deterministic only) Recompute log-probs & re-mine every N epochs after start; 0 = mine once.",
     )
     parser.add_argument(
         "--hard-mining-thresholds",
@@ -238,6 +260,24 @@ async def main():
         type=int,
         default=2,
         help="(EnvTask deterministic only) Batch size for log-prob evaluation during hard mining.",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=ENV_TASK_DEFAULTS["max_seq_len"],
+        help="(EnvTask only) Max sequence length for SFT examples. Lower this if you hit OOM.",
+    )
+    parser.add_argument(
+        "--max-assistant-responses",
+        type=int,
+        default=ENV_TASK_DEFAULTS["max_assistant_responses"],
+        help="(EnvTask only) How many assistant turns to train on per episode. >1 increases memory a lot.",
+    )
+    parser.add_argument(
+        "--max-epochs",
+        type=float,
+        default=ENV_TASK_DEFAULTS["max_epochs"],
+        help="(EnvTask only) Max total epochs; 0 uses default (deterministic vs non-deterministic default).",
     )
     args = parser.parse_args()
 
@@ -281,8 +321,12 @@ async def main():
             hours_to_complete=args.hours_to_complete,
             deterministic=deterministic,
             hard_mining_start_epoch=args.hard_mining_start_epoch,
+            hard_mining_every_epochs=args.hard_mining_every_epochs,
             hard_mining_thresholds=thresholds,
             hard_mining_eval_batch_size=args.hard_mining_eval_batch_size,
+            max_seq_len=args.max_seq_len,
+            max_assistant_responses=args.max_assistant_responses,
+            max_epochs=args.max_epochs,
         )
         patch_wandb_symlinks(train_cst.WANDB_LOGS_DIR)
         return
@@ -319,13 +363,16 @@ def run_envtask_sft(
     dataset_path: str,
     model_path: str,
     output_dir: str,
-    max_seq_len: int = 4096,
+    max_seq_len: int = ENV_TASK_DEFAULTS["max_seq_len"],
+    max_assistant_responses: int = ENV_TASK_DEFAULTS["max_assistant_responses"],
     allowed_task_ids: Optional[set[int]] = None,
     hours_to_complete: float = 0.0,
     deterministic: bool = False,
-    hard_mining_start_epoch: float = 0.0,
+    hard_mining_start_epoch: float = ENV_TASK_DEFAULTS["hard_mining_start_epoch"],
+    hard_mining_every_epochs: float = ENV_TASK_DEFAULTS["hard_mining_every_epochs"],
     hard_mining_thresholds: Optional[List[tuple[float, int]]] = None,
     hard_mining_eval_batch_size: int = 2,
+    max_epochs: float = ENV_TASK_DEFAULTS["max_epochs"],
 ):
     wall_clock_start = time.time()
     print(f"[EnvTask-SFT] Loading model from {model_path}", flush=True)
@@ -337,7 +384,14 @@ def run_envtask_sft(
             tokenizer.pad_token = tokenizer.unk_token
         else:
             tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, device_map="auto")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        device_map="auto",
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
     if len(tokenizer) != model.get_input_embeddings().weight.shape[0]:
         model.resize_token_embeddings(len(tokenizer))
     model.gradient_checkpointing_enable()
@@ -347,6 +401,7 @@ def run_envtask_sft(
         model.config.attn_implementation = "flash_attention_2"
     except Exception:
         model.config.attn_implementation = "sdpa"
+    print(f"[EnvTask-SFT] attn_implementation={getattr(model.config, 'attn_implementation', None)} dtype={dtype}", flush=True)
 
     print(f"[EnvTask-SFT] Loading dataset from {dataset_path}", flush=True)
     raw_ds = load_dataset("json", data_files=dataset_path, split="train")
@@ -420,6 +475,20 @@ def run_envtask_sft(
                 control.should_training_stop = True
             return control
 
+    class StdoutLogCallback(TrainerCallback):
+        def __init__(self, prefix: str = "[EnvTask-SFT][train]"):
+            self.prefix = prefix
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return control
+            # Keep it compact + stable
+            keys = ("loss", "grad_norm", "learning_rate", "epoch", "step")
+            payload = {k: logs[k] for k in keys if k in logs}
+            if payload:
+                print(f"{self.prefix} {payload}", flush=True)
+            return control
+
     def _format_messages_to_text(tok, messages, add_generation_prompt: bool = False) -> str:
         # Prefer the model's chat template when available; fall back to a simple serialization otherwise.
         if hasattr(tok, "apply_chat_template"):
@@ -436,17 +505,6 @@ def run_envtask_sft(
         if add_generation_prompt:
             parts.append("ASSISTANT:\n")
         return "\n\n".join(parts)
-
-    def _find_last_subsequence(haystack_ids: List[int], needle_ids: List[int]) -> Optional[int]:
-        if not needle_ids:
-            return None
-        H, N = len(haystack_ids), len(needle_ids)
-        if N > H:
-            return None
-        for i in range(H - N, -1, -1):
-            if haystack_ids[i : i + N] == needle_ids:
-                return i
-        return None
 
     def _extract_messages(ex: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         # Supported formats:
@@ -468,13 +526,28 @@ def run_envtask_sft(
             return [{"role": "user", "content": instruction}, {"role": "assistant", "content": output}]
         return None
 
-    def _build_assistant_sequences(
+    def _encode_ids(tok, messages: List[Dict[str, Any]], add_generation_prompt: bool) -> List[int]:
+        text = _format_messages_to_text(tok, messages, add_generation_prompt=add_generation_prompt)
+        enc = tok(text, add_special_tokens=False, truncation=False, return_tensors=None)
+        ids = enc.get("input_ids") or []
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return [int(x) for x in ids]
+
+    def _build_episode_chunks(
         tok,
         ex: Dict[str, Any],
         max_length: int,
         max_assistant_responses: int,
-        eos_tok: str,
+        min_prev_assistant_tokens: int = 200,
     ) -> List[tuple[list[int], list[bool]]]:
+        """
+        Episode-level windows:
+        - Treat a multi-turn episode as one logical sample.
+        - If it exceeds max_length, split into multiple windows without ever cutting an assistant turn.
+        - For windows after the first, try to include the previous assistant turn (overlap) when it has
+          at least min_prev_assistant_tokens and fits.
+        """
         messages = _extract_messages(ex)  # type: ignore[arg-type]
         if not isinstance(messages, list) or not messages:
             return []
@@ -482,60 +555,131 @@ def run_envtask_sft(
         assistant_indices = [i for i, m in enumerate(messages) if (m.get("role") or "").strip().lower() == "assistant"]
         if not assistant_indices:
             return []
+        assistant_indices = assistant_indices[: max(0, int(max_assistant_responses))]
 
-        sequences: List[tuple[list[int], list[bool]]] = []
-        for idx in assistant_indices[: max_assistant_responses]:
-            assistant_content = (messages[idx].get("content") or "").strip()
-            if not assistant_content:
-                continue
-            if idx <= 1 and assistant_content.lower().startswith("ok"):
-                continue
-
-            assistant_text = assistant_content + eos_tok
-            prompt_text = _format_messages_to_text(tok, messages[:idx], add_generation_prompt=True)
-            full_text = prompt_text + assistant_text
-
-            enc = tok(full_text, add_special_tokens=False, truncation=False, return_tensors=None)
+        # Fast path: single tokenization + offset mapping, compute assistant spans by character boundaries.
+        spans: List[tuple[int, int]] = []
+        full_ids: List[int] = []
+        offsets: Optional[List[tuple[int, int]]] = None
+        try:
+            full_text = _format_messages_to_text(tok, messages, add_generation_prompt=False)
+            enc = tok(
+                full_text,
+                add_special_tokens=False,
+                truncation=False,
+                return_offsets_mapping=True,
+                return_tensors=None,
+            )
             ids = enc.get("input_ids") or []
-            if not ids:
-                continue
+            if ids and isinstance(ids[0], list):
+                ids = ids[0]
+            full_ids = [int(x) for x in ids]
+            off = enc.get("offset_mapping")
+            if off and isinstance(off[0], list):
+                off = off[0]
+            offsets = [(int(a), int(b)) for (a, b) in (off or [])]
+        except Exception:
+            offsets = None
 
-            assistant_ids = tok.encode(assistant_text, add_special_tokens=False)
-            if not assistant_ids:
-                continue
-            if len(assistant_ids) > max_length:
-                continue
+        if offsets and full_ids and len(offsets) == len(full_ids):
+            def _char_to_token_start(pos: int) -> Optional[int]:
+                # first token whose end > pos
+                for i, (_s, e) in enumerate(offsets):  # type: ignore[arg-type]
+                    if e > pos:
+                        return i
+                return None
 
-            start = _find_last_subsequence(ids, assistant_ids)
-            if start is None:
-                start = len(ids) - len(assistant_ids)
-                if start < 0:
+            def _char_to_token_end(pos: int, start_from: int) -> int:
+                # first token whose start >= pos
+                for i in range(start_from, len(offsets)):  # type: ignore[arg-type]
+                    s, _e = offsets[i]
+                    if s >= pos:
+                        return i
+                return len(offsets)  # type: ignore[arg-type]
+
+            for idx in assistant_indices:
+                assistant_content = (messages[idx].get("content") or "").strip()
+                if not assistant_content:
                     continue
-            end = start + len(assistant_ids)
+                if idx <= 1 and assistant_content.lower().startswith("ok"):
+                    continue
 
-            if len(ids) > max_length:
-                w_end = end
+                prefix_text = _format_messages_to_text(tok, messages[:idx], add_generation_prompt=True)
+                with_text = _format_messages_to_text(tok, messages[: idx + 1], add_generation_prompt=False)
+                cs, ce = len(prefix_text), len(with_text)
+                ts = _char_to_token_start(cs)
+                if ts is None:
+                    continue
+                te = _char_to_token_end(ce, ts)
+                if 0 <= ts < te <= len(full_ids):
+                    spans.append((ts, te))
+        else:
+            # Fallback: multiple tokenizations (slower but robust across tokenizers)
+            full_ids = _encode_ids(tok, messages, add_generation_prompt=False)
+            if not full_ids:
+                return []
+            for idx in assistant_indices:
+                assistant_content = (messages[idx].get("content") or "").strip()
+                if not assistant_content:
+                    continue
+                if idx <= 1 and assistant_content.lower().startswith("ok"):
+                    continue
+                before_ids = _encode_ids(tok, messages[:idx], add_generation_prompt=True)
+                with_ids = _encode_ids(tok, messages[: idx + 1], add_generation_prompt=False)
+                s, e = len(before_ids), len(with_ids)
+                if 0 <= s < e <= len(full_ids):
+                    spans.append((s, e))
+
+        if not spans:
+            return []
+
+        def _mask_for_window(w_start: int, w_end: int) -> List[bool]:
+            mask = [False] * (w_end - w_start)
+            for s, e in spans:
+                if s >= w_start and e <= w_end:
+                    for t in range(s - w_start, e - w_start):
+                        mask[t] = True
+            return mask
+
+        if len(full_ids) <= max_length:
+            return [(full_ids, _mask_for_window(0, len(full_ids)))]
+
+        chunks: List[tuple[list[int], list[bool]]] = []
+        i = 0
+        while i < len(spans):
+            # Required_start is where this window may begin without cutting assistant turns.
+            i0 = i
+            if i > 0:
+                ps, pe = spans[i - 1]
+                if (pe - ps) >= int(min_prev_assistant_tokens) and (spans[i][1] - ps) <= max_length:
+                    i0 = i - 1
+
+            required_start = spans[i0][0]
+
+            j = i
+            while j + 1 < len(spans) and (spans[j + 1][1] - required_start) <= max_length:
+                j += 1
+
+            w_end = spans[j][1]
+            w_start = max(0, w_end - max_length)
+            if w_start > required_start:
+                w_start = required_start
+
+            # Guard (shouldn't happen unless a single assistant span exceeds max_length)
+            if (w_end - w_start) > max_length:
                 w_start = max(0, w_end - max_length)
-                ids = ids[w_start:w_end]
-                start -= w_start
-                end = start + len(assistant_ids)
 
-            labels_mask = [False] * len(ids)
-            if 0 <= start < end <= len(ids):
-                for i in range(start, end):
-                    labels_mask[i] = True
-            else:
-                continue
-
-            sequences.append((ids, labels_mask))
-        return sequences
+            chunks.append((full_ids[w_start:w_end], _mask_for_window(w_start, w_end)))
+            i = j + 1
+        return chunks
 
     class AssistantOnlyCollator:
         """
-        Episode-level collator:
-        - builds (prompt_context + assistant_answer + EOS) using chat template
-        - labels only assistant_answer(+EOS) tokens, masks everything else with -100
-        - if too long, truncates from the LEFT but keeps the entire assistant answer
+        Episode-level collator (multi-turn = one logical sample):
+        - tokenizes the full episode
+        - labels only assistant turns (everything else masked with -100)
+        - if episode exceeds max_length, splits into multiple windows without ever cutting an assistant turn
+          and tries to overlap the previous assistant turn (>=200 tokens) between windows.
         """
 
         def __init__(self, tok, max_length: int, max_assistant_responses: int = 30):
@@ -550,12 +694,8 @@ def run_envtask_sft(
             all_input_ids: List[List[int]] = []
             all_labels: List[List[int]] = []
 
-            eos_tok = getattr(self.tok, "eos_token", None) or ""
-
             for ex in batch:
-                sequences = _build_assistant_sequences(
-                    self.tok, ex, self.max_length, self.max_assistant_responses, eos_tok
-                )
+                sequences = _build_episode_chunks(self.tok, ex, self.max_length, self.max_assistant_responses)
                 for ids, mask in sequences:
                     labels = [id_val if mask[idx] else -100 for idx, id_val in enumerate(ids)]
                     all_input_ids.append(ids)
@@ -599,32 +739,46 @@ def run_envtask_sft(
         seqs: List[tuple[list[int], list[bool]]] = []
         owners: List[int] = []
         batch_size = max(1, int(hard_mining_eval_batch_size))
-        eos_tok = getattr(tokenizer, "eos_token", None) or ""
+        t0 = time.time()
+        scored = 0
 
         for idx, ex in enumerate(ds):
-            for ids, mask in _build_assistant_sequences(
-                tokenizer, ex, max_seq_len, max_assistant_responses=30, eos_tok=eos_tok
-            ):
+            for ids, mask in _build_episode_chunks(tokenizer, ex, max_seq_len, max_assistant_responses=max_assistant_responses):
                 seqs.append((ids, mask))
                 owners.append(idx)
                 if len(seqs) >= batch_size:
                     _run_batch(seqs, owners, seq_min, device)
                     seqs, owners = [], []
+                    scored += batch_size
+                    if scored % max(50, batch_size) == 0:
+                        print(f"[EnvTask-SFT] Hard mining progress: scored≈{scored} sequences in {time.time() - t0:.1f}s", flush=True)
         if seqs:
             _run_batch(seqs, owners, seq_min, device)
 
         multipliers: List[int] = []
+        probs: List[float] = []
         for i in range(len(ds)):
             prob = seq_min.get(i, 1.0)
+            probs.append(float(prob))
             multipliers.append(_multiplier_for_prob(prob))
 
         new_indices: List[int] = []
         for i, m in enumerate(multipliers):
             new_indices.extend([i] * max(1, m))
         mined_ds = ds.select(new_indices)
+        hist = Counter(multipliers)
+        hist_s = ", ".join(f"x{m}:{c}" for m, c in sorted(hist.items(), reverse=True))
+        probs_sorted = sorted(probs)
+        p50 = probs_sorted[len(probs_sorted) // 2] if probs_sorted else 0.0
+        p10 = probs_sorted[max(0, int(0.10 * (len(probs_sorted) - 1)))] if probs_sorted else 0.0
+        p90 = probs_sorted[min(len(probs_sorted) - 1, int(0.90 * (len(probs_sorted) - 1)))] if probs_sorted else 0.0
         print(
             f"[EnvTask-SFT] Hard mining done. Dataset size {len(ds)} → {len(mined_ds)} "
             f"(avg multiplier {sum(multipliers)/len(multipliers):.2f}).",
+            flush=True,
+        )
+        print(
+            f"[EnvTask-SFT] Hard mining stats: min_prob={min(probs):.3e} p10={p10:.3e} p50={p50:.3e} p90={p90:.3e} | multipliers: {hist_s}",
             flush=True,
         )
         return mined_ds
@@ -653,22 +807,35 @@ def run_envtask_sft(
             shift_logits = logits[:, :-1, :]
             shift_labels = input_ids[:, 1:]
             shift_mask = label_mask[:, 1:]
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-            gathered = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
-            gathered_masked = gathered.masked_fill(~shift_mask, 0.0)
+            # Avoid materializing full log_softmax over vocab (huge). Compute token log-prob via:
+            # log p(y) = logit_y - logsumexp(logits)
+            token_logits = shift_logits.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+            log_norm = torch.logsumexp(shift_logits, dim=-1)
+            token_logp = token_logits - log_norm
 
         for i in range(bsz):
             mask = shift_mask[i]
             if mask.any():
-                min_prob = torch.exp(gathered_masked[i][mask]).min().item()
+                min_prob = torch.exp(token_logp[i][mask].min()).item()
             else:
                 min_prob = 1.0
             owner = owners_batch[i]
             seq_min[owner] = min(seq_min.get(owner, 1.0), min_prob)
 
     os.makedirs(output_dir, exist_ok=True)
-    base_epochs = 100 if deterministic else 2
-    first_phase_epochs = base_epochs if not enable_hard_mining else max(1.0, min(base_epochs, hard_mining_start_epoch))
+    default_epochs = (
+        float(ENV_TASK_DEFAULTS["deterministic_max_epochs"])
+        if deterministic
+        else float(ENV_TASK_DEFAULTS["nondeterministic_max_epochs"])
+    )
+    target_epochs = float(max_epochs) if float(max_epochs) > 0 else default_epochs
+    first_phase_epochs = target_epochs if not enable_hard_mining else max(1.0, min(target_epochs, float(hard_mining_start_epoch)))
+    print(
+        f"[EnvTask-SFT] Schedule: deterministic={deterministic} enable_hard_mining={enable_hard_mining} "
+        f"target_epochs={target_epochs} start_epoch={hard_mining_start_epoch} every_epochs={hard_mining_every_epochs} "
+        f"phase1_epochs={first_phase_epochs}",
+        flush=True,
+    )
 
     args = TrainingArguments(
         output_dir=output_dir,
@@ -689,24 +856,25 @@ def run_envtask_sft(
 
     epoch_callback = EpochBudgetCallback(hours_to_complete) if deterministic else None
     time_callback = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if deterministic else None
-    callbacks = [cb for cb in [epoch_callback, time_callback] if cb]
+    callbacks = [cb for cb in [epoch_callback, time_callback, StdoutLogCallback()] if cb]
 
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=raw_ds,
         tokenizer=tokenizer,
-        data_collator=AssistantOnlyCollator(tokenizer, max_length=max_seq_len),
+        data_collator=AssistantOnlyCollator(tokenizer, max_length=max_seq_len, max_assistant_responses=max_assistant_responses),
         callbacks=callbacks,
     )
 
-    print("[EnvTask-SFT] Starting training (phase 1)...", flush=True)
+    print(f"[EnvTask-SFT] Starting training (phase 1, {first_phase_epochs} epochs)...", flush=True)
     trainer.train()
 
     train_time_hours = max(0.0, (time.time() - wall_clock_start) / 3600.0)
     epochs_done = float(getattr(trainer.state, "epoch", 0.0) or first_phase_epochs)
     epoch_time_est = train_time_hours / max(epochs_done, 1e-6)
-    target_stop_epoch = epoch_callback.stop_epoch if epoch_callback and epoch_callback.stop_epoch is not None else base_epochs
+    computed_stop = epoch_callback.stop_epoch if epoch_callback and epoch_callback.stop_epoch is not None else target_epochs
+    target_stop_epoch = min(float(target_epochs), float(computed_stop))
     if not enable_hard_mining or target_stop_epoch <= first_phase_epochs:
         print("[EnvTask-SFT] Saving model...", flush=True)
         trainer.save_model(output_dir)
@@ -714,63 +882,87 @@ def run_envtask_sft(
         print("[EnvTask-SFT] Done.", flush=True)
         return
 
-    mining_start = time.time()
-    mined_ds = _hard_mine_dataset(raw_ds)
-    mining_hours = max(0.0, (time.time() - mining_start) / 3600.0)
-
-    elapsed_hours = max(0.0, (time.time() - wall_clock_start) / 3600.0)
-    remaining_hours = max(0.0, hours_to_complete - elapsed_hours - (5.0 / 60.0))  # 5min safety margin
-    if remaining_hours <= 0:
-        print("[EnvTask-SFT] No remaining wall-clock budget after hard mining; saving.", flush=True)
+    if epochs_done < float(first_phase_epochs) - 1e-6:
+        print("[EnvTask-SFT] Stopped during phase 1 (time budget). Saving.", flush=True)
         trainer.save_model(output_dir)
         tokenizer.save_pretrained(output_dir)
         print("[EnvTask-SFT] Done.", flush=True)
         return
 
-    size_ratio = max(1e-6, len(mined_ds) / max(1, len(raw_ds)))
-    epoch_time_phase2 = epoch_time_est * size_ratio
-    max_epochs_by_time = math.floor(remaining_hours / max(epoch_time_phase2, 1e-6))
-    remaining_epochs = min(max_epochs_by_time, max(0.0, target_stop_epoch - first_phase_epochs))
-    if remaining_epochs <= 0:
-        print("[EnvTask-SFT] Time-constrained: zero epochs available after hard mining; saving.", flush=True)
-        trainer.save_model(output_dir)
-        tokenizer.save_pretrained(output_dir)
-        print("[EnvTask-SFT] Done.", flush=True)
-        return
+    mining_period = float(hard_mining_every_epochs)
+    global_epoch = float(first_phase_epochs)
+    last_trainer = trainer
 
-    args_phase2 = TrainingArguments(
-        output_dir=output_dir,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        num_train_epochs=remaining_epochs,
-        learning_rate=4e-5,
-        logging_steps=10,
-        logging_first_step=True,
-        disable_tqdm=True,
-        save_strategy="no",
-        gradient_checkpointing=True,
-        fp16=False,
-        bf16=True,
-        report_to=[],
-        remove_unused_columns=False,
-    )
+    while global_epoch < float(target_stop_epoch) - 1e-9:
+        mining_start = time.time()
+        mined_ds = _hard_mine_dataset(raw_ds)
+        mining_hours = max(0.0, (time.time() - mining_start) / 3600.0)
 
-    time_callback_phase2 = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if deterministic else None
-    callbacks_phase2 = [cb for cb in [time_callback_phase2] if cb]
+        elapsed_hours = max(0.0, (time.time() - wall_clock_start) / 3600.0)
+        remaining_hours = max(0.0, hours_to_complete - elapsed_hours - (5.0 / 60.0))  # 5min safety margin
+        if deterministic and remaining_hours <= 0:
+            print("[EnvTask-SFT] No remaining wall-clock budget after hard mining; saving.", flush=True)
+            last_trainer.save_model(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            print("[EnvTask-SFT] Done.", flush=True)
+            return
 
-    trainer_phase2 = Trainer(
-        model=model,
-        args=args_phase2,
-        train_dataset=mined_ds,
-        tokenizer=tokenizer,
-        data_collator=AssistantOnlyCollator(tokenizer, max_length=max_seq_len),
-        callbacks=callbacks_phase2,
-    )
+        # Choose how many epochs to run before the next mining step (or until stop).
+        phase_cap = float(target_stop_epoch) - global_epoch
+        phase_epochs = phase_cap if mining_period <= 0 else min(phase_cap, max(1.0, mining_period))
 
-    print(f"[EnvTask-SFT] Restarting training (phase 2, {remaining_epochs} epochs)...", flush=True)
-    trainer_phase2.train()
+        args_phase = TrainingArguments(
+            output_dir=output_dir,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=4,
+            num_train_epochs=phase_epochs,
+            learning_rate=4e-5,
+            logging_steps=10,
+            logging_first_step=True,
+            disable_tqdm=True,
+            save_strategy="no",
+            gradient_checkpointing=True,
+            fp16=False,
+            bf16=True,
+            report_to=[],
+            remove_unused_columns=False,
+        )
+
+        time_callback_phase = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if deterministic else None
+        callbacks_phase = [cb for cb in [time_callback_phase, StdoutLogCallback(prefix="[EnvTask-SFT][train|mined]")] if cb]
+
+        phase_trainer = Trainer(
+            model=model,
+            args=args_phase,
+            train_dataset=mined_ds,
+            tokenizer=tokenizer,
+            data_collator=AssistantOnlyCollator(
+                tokenizer, max_length=max_seq_len, max_assistant_responses=max_assistant_responses
+            ),
+            callbacks=callbacks_phase,
+        )
+
+        print(
+            f"[EnvTask-SFT] Training on mined data ({phase_epochs} epochs, global_epoch={global_epoch:.2f}, mining={mining_hours:.3f}h)...",
+            flush=True,
+        )
+        phase_trainer.train()
+        last_trainer = phase_trainer
+
+        phase_done = float(getattr(phase_trainer.state, "epoch", 0.0) or 0.0)
+        if phase_done <= 0:
+            print("[EnvTask-SFT] Phase produced zero progress (time budget). Saving.", flush=True)
+            last_trainer.save_model(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            print("[EnvTask-SFT] Done.", flush=True)
+            return
+        global_epoch += min(float(phase_epochs), phase_done)
+
+        if mining_period <= 0:
+            break
+
     print("[EnvTask-SFT] Saving model...", flush=True)
-    trainer_phase2.save_model(output_dir)
+    last_trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
     print("[EnvTask-SFT] Done.", flush=True)
 

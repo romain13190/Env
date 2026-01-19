@@ -69,7 +69,7 @@ class EnvSFTConfig:
     min_prev_assistant_tokens: int = 200
 
     # Optim / LR schedule
-    learning_rate: float = 4e-8
+    learning_rate: float = 8e-5
     warmup_ratio: float = 0.03
     lr_scheduler: str = "cosine"
     min_lr_ratio: float = 0.05  # LR floor ratio vs base LR

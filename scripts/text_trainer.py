@@ -1041,7 +1041,7 @@ def run_envtask_sft(
             return control
 
     class TimeBudgetCallback(TrainerCallback):
-        def __init__(self, wall_clock_start: float, hours_budget: float, safety_minutes: float = 5.0):
+        def __init__(self, wall_clock_start: float, hours_budget: float, safety_minutes: float = 25.0):
             self.wall_clock_start = float(wall_clock_start)
             self.hours_budget = max(0.0, float(hours_budget))
             self.safety = max(0.0, safety_minutes) / 60.0
@@ -1090,7 +1090,7 @@ def run_envtask_sft(
     )
 
     epoch_callback = EpochBudgetCallback(hours_to_complete) if deterministic else None
-    time_callback = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if hours_to_complete > 0 else None
+    time_callback = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=25.0) if hours_to_complete > 0 else None
     callbacks = [cb for cb in [epoch_callback, time_callback] if cb]
 
     trainer = Trainer(

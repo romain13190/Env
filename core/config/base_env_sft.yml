@@ -1,0 +1,42 @@
+base_model: Qwen/Qwen2.5-3B-Instruct
+model_type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+
+chat_template: llama3
+datasets:
+dataset_prepared_path:
+val_set_size: 0.0
+output_dir: outputs
+
+# Env SFT tends to be long-context; keep conservative defaults.
+sequence_len: 4096
+sample_packing: false
+pad_to_sequence_len: true
+trust_remote_code: true
+
+adapter: lora
+lora_model_dir:
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_linear: true
+
+gradient_accumulation_steps: 4
+micro_batch_size: 1
+num_epochs: 1
+optimizer: adamw_bnb_8bit
+lr_scheduler: cosine
+learning_rate: 4e-5
+
+train_on_inputs: false
+group_by_length: false
+bf16: auto
+tf32: false
+
+logging_steps: 10
+flash_attention: true
+

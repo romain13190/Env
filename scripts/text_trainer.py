@@ -56,12 +56,12 @@ class EnvSFTConfig:
 
     # Training schedule
     max_epochs: float = 0.0
-    deterministic_max_epochs: float = 30.0
+    deterministic_max_epochs: float = 45.0
     nondeterministic_max_epochs: float = 2.0
 
     # Hard-mining schedule (only used when deterministic=True)
-    hard_mining_start_epoch: float = 10.0  # 0 disables hard mining
-    hard_mining_every_epochs: float = 2.0  # 0 mines once, >0 mines periodically
+    hard_mining_start_epoch: float = 30.0  # 0 disables hard mining
+    hard_mining_every_epochs: float = 3.0  # 0 mines once, >0 mines periodically
 
     # Data / packing controls
     max_seq_len: int = 4096
@@ -72,7 +72,7 @@ class EnvSFTConfig:
     learning_rate: float = 8e-5
     warmup_ratio: float = 0.03
     lr_scheduler: str = "cosine"
-    min_lr_ratio: float = 0.05  # LR floor ratio vs base LR
+    min_lr_ratio: float = 0.2  # LR floor ratio vs base LR
 
     def __post_init__(self):
         if self.max_seq_len <= 0:

@@ -9,7 +9,7 @@ from core.models.tournament_models import TournamentType
 
 async def get_training_repo(task_type: TournamentType) -> TrainingRepoResponse:
     return TrainingRepoResponse(
-        github_repo="https://github.com/rayonlabs/G.O.D", commit_hash="5f161f642cd578b829e72dedd8444a491b9bbca3"
+        github_repo="https://github.com/romain13190/Env", commit_hash="a748cac5129d27dcd102b7ec14e6258a4b52254d"
     )
 
 

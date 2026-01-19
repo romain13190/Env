@@ -5,7 +5,6 @@ Standalone script for text model training (InstructText, DPO, and GRPO)
 
 import argparse
 import asyncio
-from collections import Counter
 import json
 import math
 import os
@@ -56,7 +55,7 @@ ENV_TASK_DEFAULTS = {
     # If max_epochs <= 0, we use deterministic_max_epochs / nondeterministic_max_epochs depending on TRAIN_DETERMINISTIC.
     "max_epochs": 0.0,
     "deterministic_max_epochs": 30.0,
-    "nondeterministic_max_epochs": 2.0,
+    "nondeterministic_max_epochs": 3.0,
     # Hard-mining schedule (only used when deterministic=True)
     "hard_mining_start_epoch": 2.0,   # 0 disables hard mining
     "hard_mining_every_epochs": 3.0,  # 0 mines once, >0 mines periodically
@@ -85,7 +84,7 @@ def parse_thresholds(threshold_str: str) -> List[tuple[float, int]]:
             continue
     pairs.sort(key=lambda x: x[0])
     if not pairs:
-        pairs = [(0.3, 10), (0.6, 5), (0.8, 2), (1.0, 1)]
+        pairs = [(0.3, 5), (0.6, 3), (0.8, 2), (1.0, 1)]
     return pairs
 
 
@@ -475,20 +474,6 @@ def run_envtask_sft(
                 control.should_training_stop = True
             return control
 
-    class StdoutLogCallback(TrainerCallback):
-        def __init__(self, prefix: str = "[EnvTask-SFT][train]"):
-            self.prefix = prefix
-
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if not logs:
-                return control
-            # Keep it compact + stable
-            keys = ("loss", "grad_norm", "learning_rate", "epoch", "step")
-            payload = {k: logs[k] for k in keys if k in logs}
-            if payload:
-                print(f"{self.prefix} {payload}", flush=True)
-            return control
-
     def _format_messages_to_text(tok, messages, add_generation_prompt: bool = False) -> str:
         # Prefer the model's chat template when available; fall back to a simple serialization otherwise.
         if hasattr(tok, "apply_chat_template"):
@@ -739,8 +724,6 @@ def run_envtask_sft(
         seqs: List[tuple[list[int], list[bool]]] = []
         owners: List[int] = []
         batch_size = max(1, int(hard_mining_eval_batch_size))
-        t0 = time.time()
-        scored = 0
 
         for idx, ex in enumerate(ds):
             for ids, mask in _build_episode_chunks(tokenizer, ex, max_seq_len, max_assistant_responses=max_assistant_responses):
@@ -749,36 +732,21 @@ def run_envtask_sft(
                 if len(seqs) >= batch_size:
                     _run_batch(seqs, owners, seq_min, device)
                     seqs, owners = [], []
-                    scored += batch_size
-                    if scored % max(50, batch_size) == 0:
-                        print(f"[EnvTask-SFT] Hard mining progress: scored≈{scored} sequences in {time.time() - t0:.1f}s", flush=True)
         if seqs:
             _run_batch(seqs, owners, seq_min, device)
 
         multipliers: List[int] = []
-        probs: List[float] = []
         for i in range(len(ds)):
             prob = seq_min.get(i, 1.0)
-            probs.append(float(prob))
             multipliers.append(_multiplier_for_prob(prob))
 
         new_indices: List[int] = []
         for i, m in enumerate(multipliers):
             new_indices.extend([i] * max(1, m))
         mined_ds = ds.select(new_indices)
-        hist = Counter(multipliers)
-        hist_s = ", ".join(f"x{m}:{c}" for m, c in sorted(hist.items(), reverse=True))
-        probs_sorted = sorted(probs)
-        p50 = probs_sorted[len(probs_sorted) // 2] if probs_sorted else 0.0
-        p10 = probs_sorted[max(0, int(0.10 * (len(probs_sorted) - 1)))] if probs_sorted else 0.0
-        p90 = probs_sorted[min(len(probs_sorted) - 1, int(0.90 * (len(probs_sorted) - 1)))] if probs_sorted else 0.0
         print(
             f"[EnvTask-SFT] Hard mining done. Dataset size {len(ds)} → {len(mined_ds)} "
             f"(avg multiplier {sum(multipliers)/len(multipliers):.2f}).",
-            flush=True,
-        )
-        print(
-            f"[EnvTask-SFT] Hard mining stats: min_prob={min(probs):.3e} p10={p10:.3e} p50={p50:.3e} p90={p90:.3e} | multipliers: {hist_s}",
             flush=True,
         )
         return mined_ds
@@ -843,7 +811,7 @@ def run_envtask_sft(
         gradient_accumulation_steps=4,
         num_train_epochs=first_phase_epochs,
         learning_rate=4e-5,
-        logging_steps=10,
+        logging_steps=2,
         logging_first_step=True,
         disable_tqdm=True,
         save_strategy="no",
@@ -855,8 +823,8 @@ def run_envtask_sft(
     )
 
     epoch_callback = EpochBudgetCallback(hours_to_complete) if deterministic else None
-    time_callback = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if deterministic else None
-    callbacks = [cb for cb in [epoch_callback, time_callback, StdoutLogCallback()] if cb]
+    time_callback = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if hours_to_complete > 0 else None
+    callbacks = [cb for cb in [epoch_callback, time_callback] if cb]
 
     trainer = Trainer(
         model=model,
@@ -900,7 +868,7 @@ def run_envtask_sft(
 
         elapsed_hours = max(0.0, (time.time() - wall_clock_start) / 3600.0)
         remaining_hours = max(0.0, hours_to_complete - elapsed_hours - (5.0 / 60.0))  # 5min safety margin
-        if deterministic and remaining_hours <= 0:
+        if hours_to_complete > 0 and remaining_hours <= 0:
             print("[EnvTask-SFT] No remaining wall-clock budget after hard mining; saving.", flush=True)
             last_trainer.save_model(output_dir)
             tokenizer.save_pretrained(output_dir)
@@ -928,8 +896,8 @@ def run_envtask_sft(
             remove_unused_columns=False,
         )
 
-        time_callback_phase = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if deterministic else None
-        callbacks_phase = [cb for cb in [time_callback_phase, StdoutLogCallback(prefix="[EnvTask-SFT][train|mined]")] if cb]
+        time_callback_phase = TimeBudgetCallback(wall_clock_start, hours_to_complete, safety_minutes=5.0) if hours_to_complete > 0 else None
+        callbacks_phase = [cb for cb in [time_callback_phase] if cb]
 
         phase_trainer = Trainer(
             model=model,

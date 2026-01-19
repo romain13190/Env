@@ -18,13 +18,16 @@ def main() -> None:
     p.add_argument("--n", type=int, default=250)
     p.add_argument("--max-task-id", type=int, default=2500)
     p.add_argument("--json", action="store_true", help="Print as JSON array instead of newline-separated.")
+    p.add_argument("--out", type=str, default="", help="Optional output file path (writes instead of printing).")
     args = p.parse_args()
 
     ids = alfworld_eval_task_ids(seed=args.seed, n=args.n, max_task_id=args.max_task_id)
-    if args.json:
-        print(json.dumps(ids))
+    content = json.dumps(ids) if args.json else "\n".join(map(str, ids))
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(content + ("\n" if not content.endswith("\n") else ""))
     else:
-        print("\n".join(map(str, ids)))
+        print(content)
 
 
 if __name__ == "__main__":
